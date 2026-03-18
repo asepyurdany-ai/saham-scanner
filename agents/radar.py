@@ -284,13 +284,13 @@ Rules:
     try:
         response = client.messages.create(
             model="claude-sonnet-4-5",
-            max_tokens=1500,
+            max_tokens=2000,
             messages=[{"role": "user", "content": prompt}]
         )
         raw = response.content[0].text.strip()
         result = _extract_json(raw)
         if result is None:
-            print(f"[Radar] Could not parse JSON from Haiku response: {raw[:200]}")
+            print(f"[Radar] Could not parse JSON from Sonnet response: {raw[:200]}")
             return []
         return result
     except Exception as e:

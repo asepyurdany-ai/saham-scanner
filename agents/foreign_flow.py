@@ -81,6 +81,11 @@ def fetch_foreign_flow(date_str: str = None) -> dict:
             return result
 
         except Exception as e:
+            err_str = str(e)
+            if "403" in err_str or "Cloudflare" in err_str or "Forbidden" in err_str:
+                print("[ForeignFlow] IDX API blocked (Cloudflare) — foreign flow unavailable from server IP")
+                print("[ForeignFlow] Fallback: using volume-based proxy (Asing=N/A)")
+                return {}
             print(f"[ForeignFlow] Attempt {attempt + 1}/3 failed: {e}")
             if attempt < 2:
                 time.sleep(2)
