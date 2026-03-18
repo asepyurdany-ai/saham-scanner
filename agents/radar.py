@@ -42,14 +42,74 @@ GEO_FEEDS = [
     {"name": "Reuters", "url": "https://feeds.reuters.com/reuters/businessNews"},
     {"name": "Al Jazeera", "url": "https://www.aljazeera.com/xml/rss/all.xml"},
     {"name": "BBC Business", "url": "https://feeds.bbci.co.uk/news/business/rss.xml"},
+    {"name": "CNBC", "url": "https://www.cnbc.com/id/100003114/device/rss/rss.html"},
+    {"name": "MarketWatch", "url": "https://feeds.content.dowjones.io/public/rss/mw_realtimeheadlines"},
 ]
 
 GEO_KEYWORDS = [
-    "iran", "israel", "war", "conflict", "opec", "oil", "crude",
-    "fed", "interest rate", "inflation", "china", "trade war",
-    "sanctions", "indonesia", "asean", "imf", "world bank",
-    "recession", "gold", "commodity"
+    # Central banks & monetary policy
+    "fed", "federal reserve", "interest rate", "rate hike", "rate cut",
+    "powell", "fomc", "tapering", "quantitative", "monetary policy",
+    "inflation", "cpi", "deflation",
+
+    # Middle East conflict
+    "iran", "israel", "hamas", "hezbollah", "middle east", "gaza",
+    "war", "conflict", "missile", "strike", "ceasefire",
+
+    # Energy & commodities
+    "opec", "opec+", "oil", "crude", "brent", "energy",
+    "gold", "commodity", "copper", "nickel", "coal",
+
+    # Geopolitical powers
+    "china", "trade war", "tariff", "sanctions", "ukraine", "russia",
+    "north korea", "taiwan", "us dollar", "dollar",
+
+    # Global economy
+    "recession", "imf", "world bank", "gdp", "indonesia",
+    "asean", "emerging market", "debt", "default",
 ]
+
+# Context map: event type → IHSG sector impact
+# Used to enrich Haiku prompt with domain knowledge
+GEO_IMPACT_CONTEXT = """
+PANDUAN DAMPAK KE IHSG:
+
+Fed naikan suku bunga:
+→ NEGATIF: perbankan (BBCA, BBRI, BMRI, BBNI) — cost of fund naik, NIM tertekan
+→ NEGATIF: semua saham — capital outflow dari emerging market, rupiah melemah
+→ NEGATIF: GOTO, BUKA — valuasi growth stock turun
+
+Fed turunkan suku bunga / dovish:
+→ POSITIF: perbankan (BBCA, BBRI, BMRI, BBNI)
+→ POSITIF: semua saham — capital inflow ke emerging market
+→ POSITIF: GOTO, BUKA — risk-on sentiment
+
+Konflik Iran-Israel / Middle East memanas:
+→ NEGATIF global — risk-off, investor jual aset berisiko
+→ POSITIF: ANTM, MDKA — gold naik (safe haven)
+→ POSITIF: MEDC, AKRA, ELSA — oil naik
+→ NEGATIF: BBRI, BMRI, GOTO — likuiditas ketat
+
+Oil naik (WTI/Brent):
+→ POSITIF: MEDC, AKRA, ELSA, ELSA
+→ NEGATIF: ASII, ICBP, INDF, UNVR — biaya produksi naik
+
+Gold naik:
+→ POSITIF: ANTM, MDKA
+
+Rupiah melemah (USD/IDR naik):
+→ NEGATIF: BBCA, BBRI, BMRI — valuta asing jadi mahal
+→ NEGATIF: ASII, UNVR — impor jadi mahal
+→ POSITIF: ADRO, PTBA — ekspor komoditas dalam USD
+
+China ekonomi melemah / trade war:
+→ NEGATIF: ADRO, PTBA, ANTM — ekspor komoditas ke China
+→ NEGATIF: AALI — sawit ke China
+
+Perang/konflik global baru:
+→ NEGATIF: semua saham IHSG — risk-off global
+→ POSITIF: ANTM, MDKA — safe haven gold
+"""
 
 LAST_COMMODITY_FILE = "data/radar_commodities.json"
 LAST_GEO_SEEN_FILE = "data/radar_geo_seen.json"
@@ -192,16 +252,33 @@ def analyze_geo_impact(articles: list) -> list:
         for i, a in enumerate(articles[:6])
     ])
 
-    prompt = f"""Kamu analis pasar saham Indonesia (IHSG).
-Analisa dampak berita global berikut ke IHSG dan komoditas.
+    prompt = f"""Kamu adalah hedge fund manager yang spesialis pasar saham Indonesia (IHSG).
+Tugasmu: analisa dampak berita global berikut ke IHSG dengan presisi tinggi.
 
-Format JSON array:
-[{{"judul": "...", "dampak_ihsg": "POSITIF/NEGATIF/NETRAL", "level": "TINGGI/SEDANG/RENDAH", "saham_terdampak": ["ANTM", "MEDC"], "analisa": "1 kalimat Indonesia"}}]
+{GEO_IMPACT_CONTEXT}
+
+Watchlist IHSG: BBCA, BBRI, BMRI, BBNI, TLKM, EXCL, ANTM, MDKA, MEDC, GOTO, BUKA, ASII, AALI, UNVR, ICBP, INDF, ADRO, PTBA, SMGR, INTP, AKRA, ELSA
+
+Format JSON array — satu objek per berita yang relevan:
+[{{
+  "judul": "judul singkat berita",
+  "event_type": "FED/GEOPOLITIK/KOMODITAS/EKONOMI/LAINNYA",
+  "dampak_ihsg": "POSITIF/NEGATIF/NETRAL",
+  "level": "TINGGI/SEDANG/RENDAH",
+  "saham_terdampak": ["BBCA", "MEDC"],
+  "alasan": "penjelasan singkat mengapa saham ini terdampak",
+  "analisa": "1 kalimat ringkasan dalam Bahasa Indonesia"
+}}]
 
 Berita:
 {news_text}
 
-Hanya JSON, tidak ada teks lain."""
+Rules:
+- Hanya include berita yang RELEVAN ke IHSG (skip berita tidak relevan)
+- level TINGGI = dampak besar dalam 1-3 hari trading
+- level SEDANG = dampak ada tapi tidak langsung
+- level RENDAH = skip saja, jangan include
+- Hanya JSON, tidak ada teks lain."""
 
     try:
         response = client.messages.create(
@@ -244,20 +321,37 @@ def format_geo_alert(analyses: list) -> str:
     now_wib = datetime.utcnow() + timedelta(hours=7)
     lines = [f"🌐 <b>GEOPOLITIK ALERT — {now_wib.strftime('%H:%M')} WIB</b>", ""]
 
+    EVENT_EMOJI = {
+        "FED": "🏦",
+        "GEOPOLITIK": "⚔️",
+        "KOMODITAS": "🛢",
+        "EKONOMI": "📉",
+        "LAINNYA": "📌",
+    }
+
     for a in analyses:
         if a.get("level") == "RENDAH":
             continue
-        emoji = "🟢" if a["dampak_ihsg"] == "POSITIF" else "🔴" if a["dampak_ihsg"] == "NEGATIF" else "⚪"
-        saham = ", ".join(a.get("saham_terdampak", [])[:4])
-        lines.append(f"{emoji} <b>{a.get('judul', '')[:60]}</b>")
-        lines.append(f"   {a.get('analisa', '')}")
+        dampak = a.get("dampak_ihsg", "NETRAL")
+        emoji = "🟢" if dampak == "POSITIF" else "🔴" if dampak == "NEGATIF" else "⚪"
+        event_emoji = EVENT_EMOJI.get(a.get("event_type", "LAINNYA"), "📌")
+        level_tag = "🔥" if a.get("level") == "TINGGI" else "📌"
+        saham = ", ".join(a.get("saham_terdampak", [])[:5])
+        alasan = a.get("alasan", "")
+        analisa = a.get("analisa", "")
+
+        lines.append(f"{emoji}{event_emoji}{level_tag} <b>{a.get('judul', '')[:70]}</b>")
+        if alasan:
+            lines.append(f"   💡 {alasan}")
+        if analisa and analisa != alasan:
+            lines.append(f"   📝 {analisa}")
         if saham:
             lines.append(f"   📊 Watch: <b>{saham}</b>")
         lines.append("")
 
     if len(lines) <= 3:
         return None
-    lines.append("<i>⚠️ Konfirmasi sebelum trading.</i>")
+    lines.append("<i>⚠️ Konfirmasi sebelum trading. DYOR.</i>")
     return "\n".join(lines)
 
 
