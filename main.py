@@ -48,10 +48,37 @@ def now_wib():
     return datetime.utcnow() + timedelta(hours=7)
 
 
+IDX_HOLIDAYS_2026 = {
+    "2026-01-01",  # Tahun Baru
+    "2026-01-27",  # Isra Mi'raj
+    "2026-01-29",  # Tahun Baru Imlek
+    "2026-03-19",  # Nyepi
+    "2026-03-20",  # Wafat Isa Almasih (Good Friday)
+    "2026-04-01",  # Hari Raya Idul Fitri
+    "2026-04-02",  # Hari Raya Idul Fitri
+    "2026-04-03",  # Cuti Bersama
+    "2026-05-01",  # Hari Buruh
+    "2026-05-14",  # Kenaikan Isa Almasih
+    "2026-05-23",  # Hari Raya Waisak
+    "2026-06-01",  # Hari Lahir Pancasila
+    "2026-06-06",  # Idul Adha
+    "2026-06-26",  # Tahun Baru Islam
+    "2026-08-17",  # HUT RI
+    "2026-09-04",  # Maulid Nabi
+    "2026-12-25",  # Natal
+}
+
+
 def is_market_day() -> bool:
-    """Skip weekends. TODO: add IDX holiday calendar"""
+    """Returns True if IDX is open today (weekday + not a public holiday)."""
     wib = now_wib()
-    return wib.weekday() < 5  # Mon-Fri
+    if wib.weekday() >= 5:  # weekend
+        return False
+    date_str = wib.strftime("%Y-%m-%d")
+    if date_str in IDX_HOLIDAYS_2026:
+        print(f"[Scheduler] IDX holiday today ({date_str}) — skipping market tasks")
+        return False
+    return True
 
 
 def is_market_hours_utc() -> bool:
@@ -246,8 +273,8 @@ def safe_run_breadth_check():
 
 
 def safe_run_premarket():
-    """Run pre-market briefing at 07:00 WIB (00:00 UTC) on weekdays."""
-    if not is_market_day():
+    """Run pre-market briefing at 07:00 WIB on weekdays — including holidays (global markets still open)."""
+    if now_wib().weekday() >= 5:  # skip weekend only
         return
     safe_run(run_premarket_briefing, "Pre-market Briefing")
 
