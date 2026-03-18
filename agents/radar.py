@@ -55,6 +55,35 @@ LAST_COMMODITY_FILE = "data/radar_commodities.json"
 LAST_GEO_SEEN_FILE = "data/radar_geo_seen.json"
 
 
+def _extract_json(text: str):
+    """
+    Robustly extract JSON from Haiku response.
+    Handles: pure JSON, markdown code blocks, leading/trailing text.
+    Returns parsed object or None.
+    """
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    import re
+    match = re.search(r'```(?:json)?\s*([\s\S]+?)\s*```', text)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except json.JSONDecodeError:
+            pass
+    for pattern in (r'(\[[\s\S]+\])', r'(\{[\s\S]+\})'):
+        match = re.search(pattern, text)
+        if match:
+            try:
+                return json.loads(match.group(1))
+            except json.JSONDecodeError:
+                pass
+    return None
+
+
 def send_telegram(msg: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     resp = requests.post(url, json={
@@ -180,7 +209,12 @@ Hanya JSON, tidak ada teks lain."""
             max_tokens=800,
             messages=[{"role": "user", "content": prompt}]
         )
-        return json.loads(response.content[0].text)
+        raw = response.content[0].text.strip()
+        result = _extract_json(raw)
+        if result is None:
+            print(f"[Radar] Could not parse JSON from Haiku response: {raw[:200]}")
+            return []
+        return result
     except Exception as e:
         print(f"[Radar] Haiku error: {e}")
         return []

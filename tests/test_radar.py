@@ -248,3 +248,105 @@ class TestFormatCommodityAlert:
 
         # Should contain WIB timestamp
         assert "WIB" in msg
+
+
+# --- _extract_json Tests (Radar) ---
+
+class TestRadarExtractJson:
+
+    def test_pure_json_array(self):
+        """Should parse pure JSON array."""
+        from agents.radar import _extract_json
+        text = '[{"judul": "test", "dampak_ihsg": "NEGATIF"}]'
+        result = _extract_json(text)
+        assert result is not None
+        assert result[0]["dampak_ihsg"] == "NEGATIF"
+
+    def test_markdown_wrapped_json(self):
+        """Should parse JSON inside markdown code block."""
+        from agents.radar import _extract_json
+        text = '```json\n[{"judul": "OPEC cuts output", "level": "TINGGI"}]\n```'
+        result = _extract_json(text)
+        assert result is not None
+        assert result[0]["level"] == "TINGGI"
+
+    def test_json_with_leading_text(self):
+        """Should extract JSON even with leading text."""
+        from agents.radar import _extract_json
+        text = 'Analisa:\n[{"judul": "test", "dampak_ihsg": "POSITIF"}]'
+        result = _extract_json(text)
+        assert result is not None
+        assert result[0]["dampak_ihsg"] == "POSITIF"
+
+    def test_empty_returns_none(self):
+        """Empty string returns None."""
+        from agents.radar import _extract_json
+        assert _extract_json("") is None
+
+    def test_none_returns_none(self):
+        """None input returns None."""
+        from agents.radar import _extract_json
+        assert _extract_json(None) is None
+
+    def test_invalid_json_returns_none(self):
+        """Invalid JSON returns None."""
+        from agents.radar import _extract_json
+        assert _extract_json("not json at all!!!") is None
+
+
+# --- analyze_geo_impact Mock Tests ---
+
+class TestAnalyzeGeoImpact:
+
+    def test_returns_empty_on_no_articles(self):
+        """Should return [] immediately if no articles."""
+        from agents.radar import analyze_geo_impact
+        result = analyze_geo_impact([])
+        assert result == []
+
+    def test_returns_list_on_valid_haiku_response(self):
+        """Should return list when Haiku returns valid JSON."""
+        from unittest.mock import patch, MagicMock
+        from agents.radar import analyze_geo_impact
+
+        with patch('agents.radar.anthropic.Anthropic') as mock_anthropic:
+            mock_client = MagicMock()
+            mock_anthropic.return_value = mock_client
+            mock_response = MagicMock()
+            mock_response.content = [MagicMock(text='[{"judul": "OPEC cuts", "dampak_ihsg": "NEGATIF", "level": "TINGGI", "saham_terdampak": ["MEDC"], "analisa": "Minyak naik"}]')]
+            mock_client.messages.create.return_value = mock_response
+
+            articles = [{"source": "Reuters", "title": "OPEC cuts output", "summary": "test", "id": "1"}]
+            result = analyze_geo_impact(articles)
+            assert isinstance(result, list)
+            assert len(result) == 1
+
+    def test_returns_empty_on_bad_haiku_response(self):
+        """Should return [] when Haiku returns unparseable response."""
+        from unittest.mock import patch, MagicMock
+        from agents.radar import analyze_geo_impact
+
+        with patch('agents.radar.anthropic.Anthropic') as mock_anthropic:
+            mock_client = MagicMock()
+            mock_anthropic.return_value = mock_client
+            mock_response = MagicMock()
+            mock_response.content = [MagicMock(text='')]
+            mock_client.messages.create.return_value = mock_response
+
+            articles = [{"source": "Reuters", "title": "test", "summary": "test", "id": "1"}]
+            result = analyze_geo_impact(articles)
+            assert result == []
+
+    def test_handles_api_exception(self):
+        """Should return [] if API throws exception."""
+        from unittest.mock import patch, MagicMock
+        from agents.radar import analyze_geo_impact
+
+        with patch('agents.radar.anthropic.Anthropic') as mock_anthropic:
+            mock_client = MagicMock()
+            mock_anthropic.return_value = mock_client
+            mock_client.messages.create.side_effect = Exception("connection error")
+
+            articles = [{"source": "Reuters", "title": "test", "summary": "test", "id": "1"}]
+            result = analyze_geo_impact(articles)
+            assert result == []
