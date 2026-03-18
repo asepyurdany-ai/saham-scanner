@@ -168,6 +168,32 @@ def run_weekly_improvement_report():
         print(f"[Main] Improvement report error: {e}")
 
 
+def safe_run_position_update():
+    """Send 30-min position P&L update during market hours (only if positions exist)."""
+    if not is_market_day():
+        return
+    if not is_market_hours_utc():
+        return
+    try:
+        positions = load_positions(DEFAULT_POSITIONS_FILE)
+        if positions:
+            send_position_update(positions)
+    except Exception as e:
+        log_error("PositionUpdate", str(e), "safe_run_position_update")
+        print(f"[Main] Position update error: {e}")
+
+
+def run_friday_journal():
+    """Send journal summary on Fridays EOD."""
+    if now_wib().weekday() != 4:  # 4 = Friday
+        return
+    try:
+        send_journal_summary()
+    except Exception as e:
+        log_error("JournalSummary", str(e), "run_friday_journal")
+        print(f"[Main] Journal summary error: {e}")
+
+
 # ─── Macro Shock: every 5 min during market hours ──────────────────────────
 # 01:55–08:00 UTC = 08:55–15:00 WIB, every 5 minutes
 MACRO_SHOCK_SLOTS = [
@@ -400,32 +426,6 @@ def check_telegram_commands():
         except Exception as e:
             print(f"[Main] Telegram poll error: {e}")
             time.sleep(10)
-
-
-def safe_run_position_update():
-    """Send 30-min position P&L update during market hours (only if positions exist)."""
-    if not is_market_day():
-        return
-    if not is_market_hours_utc():
-        return
-    try:
-        positions = load_positions(DEFAULT_POSITIONS_FILE)
-        if positions:
-            send_position_update(positions)
-    except Exception as e:
-        log_error("PositionUpdate", str(e), "safe_run_position_update")
-        print(f"[Main] Position update error: {e}")
-
-
-def run_friday_journal():
-    """Send journal summary on Fridays EOD."""
-    if now_wib().weekday() != 4:  # 4 = Friday
-        return
-    try:
-        send_journal_summary()
-    except Exception as e:
-        log_error("JournalSummary", str(e), "run_friday_journal")
-        print(f"[Main] Journal summary error: {e}")
 
 
 def run_daemon():
