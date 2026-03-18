@@ -124,10 +124,95 @@ def compute_macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int =
     return macd_line, signal_line
 
 
-def compute_signals(ticker: str, df: pd.DataFrame) -> dict:
+def get_ticker_sector(ticker: str) -> str:
+    """Return sector name for a given ticker."""
+    for sector, tickers in SECTOR_MAP.items():
+        if ticker in tickers:
+            return sector
+    return "Unknown"
+
+
+def format_context_line(ctx: dict, ticker_sector: str) -> str:
+    """
+    Return 2-3 lines of macro/sentiment/geo context for a ticker's sector.
+    Used in morning alert injection.
+    """
+    if not ctx:
+        return ""
+
+    macro = ctx.get("macro", {})
+    sentiment = ctx.get("sentiment", {})
+    geo = ctx.get("geo", {})
+
+    lines = []
+
+    # Macro line
+    rupiah_pct = macro.get("rupiah_change_pct", 0.0)
+    rupiah_emoji = "✅" if abs(rupiah_pct) < 0.5 else ("⚠️" if rupiah_pct < -1.0 else "⚠️")
+    rupiah_label = "stabil" if abs(rupiah_pct) < 0.5 else ("melemah" if rupiah_pct > 0 else "menguat")
+    lines.append(f"🌍 Macro: Rupiah {rupiah_pct:+.1f}% {rupiah_label} {rupiah_emoji}")
+
+    # Sentiment line — only if sector is affected
+    news_sentiment = sentiment.get("news_sentiment", "NETRAL")
+    affected_sectors = sentiment.get("affected_sectors", [])
+    if ticker_sector in affected_sectors:
+        sent_emoji = "✅" if news_sentiment == "POSITIF" else ("❌" if news_sentiment == "NEGATIF" else "➖")
+        lines.append(
+            f"📰 Berita: {ticker_sector} — sentimen {news_sentiment} {sent_emoji}"
+        )
+
+    # Geo line
+    geo_risk = geo.get("risk_level", "LOW")
+    geo_emoji = "✅" if geo_risk == "LOW" else ("⚠️" if geo_risk == "MEDIUM" else "🔴")
+    lines.append(f"🌐 Geo: Risk {geo_risk} {geo_emoji}")
+
+    return "\n".join(lines)
+
+
+def validate_signal(signal: dict, ctx: dict) -> tuple:
+    """
+    Validate a signal against market context.
+
+    Returns:
+        (is_valid: bool, reason: str)
+
+    Rules:
+    - RISK_OFF + score < 6 → False
+    - macro_shock_active + score < 6 → False
+    - geo risk HIGH → True with warning
+    - else → True
+    """
+    if not ctx:
+        return True, "No context available"
+
+    score = signal.get("score", 0)
+    market_mode = ctx.get("market_mode", "NORMAL")
+    macro_shock = ctx.get("macro", {}).get("macro_shock_active", False)
+    geo_risk = ctx.get("geo", {}).get("risk_level", "LOW")
+
+    if market_mode == "RISK_OFF" and score < 6:
+        return False, f"RISK_OFF mode aktif — butuh skor 6/6 (saat ini {score}/6)"
+
+    if macro_shock and score < 6:
+        return False, f"Macro shock aktif — butuh skor 6/6 (saat ini {score}/6)"
+
+    if geo_risk == "HIGH":
+        return True, f"⚠️ Geo Risk HIGH — hati-hati, konfirmasi ekstra diperlukan"
+
+    reasons = []
+    if market_mode == "CAUTIOUS":
+        reasons.append("mode CAUTIOUS")
+    if market_mode == "RISK_ON":
+        reasons.append("mode RISK_ON — momentum bagus")
+
+    reason = " | ".join(reasons) if reasons else "OK"
+    return True, reason
+
+
+def compute_signals(ticker: str, df: pd.DataFrame, ctx: dict = None, threshold: int = None) -> dict:
     """
     Compute technical signals.
-    Hedge fund rule: need 5/6 conditions for STRONG BUY.
+    Hedge fund rule: need 5/6 conditions for STRONG BUY (dynamic threshold).
 
     Conditions:
       1. Trend naik: MA20 > MA50
@@ -230,8 +315,38 @@ def compute_signals(ticker: str, df: pd.DataFrame) -> dict:
 
     score = sum(conditions.values())
 
+    # --- Context-aware threshold ---
+    if threshold is None:
+        # Load context if not provided
+        if ctx is None:
+            try:
+                from agents.market_context import get_context, get_dynamic_threshold
+                ctx = get_context()
+                buy_threshold = get_dynamic_threshold()
+            except Exception:
+                buy_threshold = 5
+        else:
+            try:
+                from agents.market_context import get_dynamic_threshold
+                buy_threshold = get_dynamic_threshold()
+            except Exception:
+                buy_threshold = 5
+    else:
+        buy_threshold = threshold
+
+    # Sector downgrade: if ticker's sector has negative sentiment, require +1
+    if ctx:
+        try:
+            ticker_sector = get_ticker_sector(ticker)
+            sentiment_sectors = ctx["sentiment"].get("affected_sectors", [])
+            news_sentiment = ctx["sentiment"].get("news_sentiment", "NETRAL")
+            if ticker_sector in sentiment_sectors and news_sentiment == "NEGATIF":
+                buy_threshold = min(buy_threshold + 1, 6)
+        except Exception:
+            pass
+
     # Signal levels
-    if score >= 5:
+    if score >= buy_threshold:
         signal = "STRONG BUY"
     elif score >= 3:
         signal = "WATCH"
@@ -277,6 +392,7 @@ def compute_signals(ticker: str, df: pd.DataFrame) -> dict:
         "tp_pct": tp_pct,
         "sl_pct": sl_pct,
         "score": int(score),
+        "buy_threshold": int(buy_threshold),
         "conditions": conditions,
         "approaching_ara": bool(approaching_ara),
         "near_arb": bool(near_arb),
@@ -355,13 +471,24 @@ def scan_all() -> list:
     results = []
     print(f"[Scanner] Scanning {len(WATCHLIST)} stocks...")
 
+    # Load context once for all tickers in this scan
+    ctx = None
+    threshold = 5
+    try:
+        from agents.market_context import get_context, get_dynamic_threshold
+        ctx = get_context()
+        threshold = get_dynamic_threshold()
+        print(f"[Scanner] Market mode: {ctx.get('market_mode', 'NORMAL')}, threshold: {threshold}/6")
+    except Exception as e:
+        print(f"[Scanner] Could not load market context: {e}")
+
     for ticker in WATCHLIST:
         try:
             df = get_stock_data(ticker)
-            signal = compute_signals(ticker, df)
+            signal = compute_signals(ticker, df, ctx=ctx, threshold=threshold)
             if signal:
                 results.append(signal)
-                print(f"  {ticker}: {signal['signal']} (score={signal['score']}/6, "
+                print(f"  {ticker}: {signal['signal']} (score={signal['score']}/{signal.get('buy_threshold', 5)}, "
                       f"RSI={signal['rsi']}, vol={signal['vol_ratio']}x, "
                       f"MACD={'✅' if signal['macd_bullish'] else '❌'})")
         except Exception as e:
@@ -373,14 +500,33 @@ def scan_all() -> list:
 
 
 def format_morning_alert(signals: list, macro: dict = None, market_context: str = None) -> str:
-    """Format morning briefing Telegram message with macro + trade setup"""
+    """Format morning briefing Telegram message with macro + trade setup + market context"""
     strong_buy_signals = [s for s in signals if s["signal"] == "STRONG BUY"]
     watch_signals = [s for s in signals if s["signal"] == "WATCH"]
 
     now_wib = datetime.utcnow() + timedelta(hours=7)
+
+    # Load shared market context for enriched output
+    ctx = None
+    try:
+        from agents.market_context import get_context, format_context_summary
+        ctx = get_context()
+        mode = ctx.get("market_mode", "NORMAL")
+    except Exception:
+        mode = "NORMAL"
+
+    mode_label = {
+        "RISK_OFF": "🔴 RISK OFF",
+        "CAUTIOUS": "🟡 CAUTIOUS",
+        "NORMAL": "⚪ NORMAL",
+        "RISK_ON": "🟢 RISK ON",
+    }.get(mode, "⚪ NORMAL")
+
+    threshold = strong_buy_signals[0].get("buy_threshold", 5) if strong_buy_signals else 5
+
     lines = [
         f"🏦 <b>MORNING SCAN — {now_wib.strftime('%d %b %Y %H:%M')} WIB</b>",
-        f"<i>Hedge fund mode: STRONG BUY hanya 5-6/6 konfirmasi</i>",
+        f"<i>Hedge fund mode: {mode_label} | STRONG BUY threshold: {threshold}/6</i>",
         "",
     ]
 
@@ -405,15 +551,48 @@ def format_morning_alert(signals: list, macro: dict = None, market_context: str 
             whale = "🐋 " if s["vol_ratio"] >= 2.0 else ""
             macd_tag = "✅" if s.get("macd_bullish") else "❌"
             ma_tag = "✅" if s["conditions"].get("uptrend") else "❌"
+            buy_thr = s.get("buy_threshold", 5)
+
+            # Trading style
+            style_info = classify_trading_style(s)
+            style_tag = f"\n{style_info['style']}" if style_info.get("style") else ""
 
             lines.append(f"")
-            lines.append(f"{whale}<b>{ticker_clean}</b> — STRONG BUY ({s['score']}/6)")
+            lines.append(f"{whale}<b>{ticker_clean}</b> — STRONG BUY ({s['score']}/{buy_thr}){style_tag}")
             lines.append(f"📍 Entry : Rp {s['current']:,.0f}")
-            lines.append(f"🎯 TP    : Rp {s['tp']:,.0f} (+{s.get('tp_pct', 8.0):.0f}%)")
-            lines.append(f"🛡 SL    : Rp {s['sl']:,.0f} ({s.get('sl_pct', -4.0):.0f}%)")
+
+            # TP/SL: show intraday + swing if available, else default
+            if style_info.get("intraday_tp") and style_info.get("swing_tp"):
+                lines.append(
+                    f"🎯 TP Intraday: Rp {style_info['intraday_tp']:,.0f} | "
+                    f"TP Swing: Rp {style_info['swing_tp']:,.0f}"
+                )
+                lines.append(
+                    f"🛡 SL Intraday: Rp {style_info['intraday_sl']:,.0f} | "
+                    f"SL Swing: Rp {style_info['swing_sl']:,.0f}"
+                )
+            else:
+                lines.append(f"🎯 TP    : Rp {s['tp']:,.0f} (+{s.get('tp_pct', 8.0):.0f}%)")
+                lines.append(f"🛡 SL    : Rp {s['sl']:,.0f} ({s.get('sl_pct', -4.0):.0f}%)")
+
             lines.append(
                 f"📊 RSI {s['rsi']} | Vol {s['vol_ratio']}x | MACD {macd_tag} | MA {ma_tag}"
             )
+
+            # Context lines for this ticker's sector
+            if ctx:
+                ticker_sector = get_ticker_sector(s["ticker"])
+                ctx_line = format_context_line(ctx, ticker_sector)
+                if ctx_line:
+                    lines.append(ctx_line)
+
+                # Signal validation
+                is_valid, reason = validate_signal(s, ctx)
+                if not is_valid:
+                    lines.append(f"⛔ FILTERED: {reason}")
+                elif reason and reason != "OK" and "No context" not in reason:
+                    lines.append(f"ℹ️ {reason}")
+
             # Key reason
             key_reasons = [r for r in s.get("reasons", []) if "warning" not in r.lower() and "⚠️" not in r]
             if key_reasons:

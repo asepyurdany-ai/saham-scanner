@@ -145,7 +145,7 @@ def analyze_performance() -> dict:
         if v["total"] >= 3
     }
 
-    return {
+    result = {
         "status": "ok",
         "total_signals": total,
         "trading_days": len(days),
@@ -155,6 +155,22 @@ def analyze_performance() -> dict:
         "overall_win_rate": win_rate,
         "ticker_win_rates": ticker_win_rates,
     }
+
+    # --- Shared Intelligence: update market context with performance ---
+    try:
+        from agents.market_context import update_performance
+        win_rate_decimal = win_rate / 100.0  # convert % to 0.0–1.0
+        if win_rate_decimal < 0.5:
+            threshold_override = 6  # poor performance → raise bar
+        elif win_rate_decimal > 0.7:
+            threshold_override = None  # great performance → use dynamic
+        else:
+            threshold_override = None  # normal range → use dynamic
+        update_performance(win_rate_decimal, threshold_override, [35, 62])
+    except Exception as e:
+        print(f"[SelfImprover] MarketContext performance update error: {e}")
+
+    return result
 
 
 def generate_improvement_report() -> str:

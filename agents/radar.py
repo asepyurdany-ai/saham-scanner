@@ -477,6 +477,18 @@ def run_commodity_check():
     else:
         print(f"[Radar] No significant commodity moves")
 
+    # --- Shared Intelligence: update market context ---
+    try:
+        from agents.market_context import update_macro
+        rupiah_pct = prices.get("USD/IDR", {}).get("change_pct", 0.0)
+        oil_pct = prices.get("WTI Oil", {}).get("change_pct", 0.0)
+        gold_pct = prices.get("Gold", {}).get("change_pct", 0.0)
+        # Macro shock: rupiah moves >1.5% or oil moves >3%
+        shock_active = abs(rupiah_pct) >= 1.5 or abs(oil_pct) >= 3.0
+        update_macro(rupiah_pct, oil_pct, gold_pct, shock_active)
+    except Exception as e:
+        print(f"[Radar] MarketContext macro update error: {e}")
+
     return prices, alerts
 
 
@@ -490,6 +502,7 @@ def run_geo_check():
 
     if not new_articles:
         print("[Radar] No new geopolitical news")
+        # Update geo context with neutral if no new data (keep existing)
         return
 
     seen.update(a["id"] for a in new_articles)
@@ -505,6 +518,30 @@ def run_geo_check():
             print(f"[Radar] Geo alert sent: {ok}")
     else:
         print(f"[Radar] {len(new_articles)} new articles, no high/medium impact")
+
+    # --- Shared Intelligence: update geo context ---
+    try:
+        from agents.market_context import update_geo
+        # Derive risk level from high-impact analyses
+        high_neg = [a for a in analyses if a.get("level") == "TINGGI" and a.get("dampak_ihsg") == "NEGATIF"]
+        med_neg = [a for a in analyses if a.get("level") == "SEDANG" and a.get("dampak_ihsg") == "NEGATIF"]
+
+        if high_neg:
+            risk_level = "HIGH"
+            geo_signal = "RISK_OFF"
+        elif med_neg:
+            risk_level = "MEDIUM"
+            geo_signal = "CAUTIOUS"
+        else:
+            risk_level = "LOW"
+            geo_signal = "NEUTRAL"
+
+        active_events = [
+            a.get("judul", "")[:60] for a in (high_neg + med_neg)[:5]
+        ]
+        update_geo(risk_level, active_events, geo_signal)
+    except Exception as e:
+        print(f"[Radar] MarketContext geo update error: {e}")
 
 
 def run_radar():

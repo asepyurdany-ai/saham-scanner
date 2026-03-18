@@ -94,6 +94,22 @@ def safe_run(fn, name: str):
             pass
 
 
+def _is_context_stale(max_age_minutes: int = 30) -> bool:
+    """Check if market context is older than max_age_minutes."""
+    try:
+        from agents.market_context import load_context
+        ctx = load_context()
+        updated_at = ctx.get("updated_at")
+        if not updated_at:
+            return True
+        from datetime import timezone
+        dt = datetime.fromisoformat(updated_at)
+        age = (datetime.utcnow() - dt).total_seconds() / 60
+        return age > max_age_minutes
+    except Exception:
+        return True
+
+
 def safe_run_realtime():
     """Real-time monitoring job (every 10 min) — only runs during market hours."""
     if not is_market_day():
@@ -101,6 +117,12 @@ def safe_run_realtime():
     if not is_market_hours_utc():
         print(f"[Main] Outside market hours — skipping real-time scan")
         return
+
+    # Refresh context if stale (>30 min) — keep scanner well-informed
+    if _is_context_stale(30):
+        print("[Main] Context stale >30min — refreshing radar + sentinel before realtime scan")
+        safe_run(run_radar, "Radar (Context Refresh)")
+        safe_run(run_sentinel, "Sentinel (Context Refresh)")
 
     safe_run(run_realtime_scan, "Real-time Scan")
     safe_run(run_position_monitor, "Position Monitor")
@@ -118,6 +140,35 @@ def safe_run_macro_shock():
 
 
 # --- Scheduled Jobs ---
+
+def run_morning_sequence():
+    """
+    CRITICAL ORDER for Shared Intelligence System:
+    1. run_radar()    → updates macro + geo context FIRST
+    2. run_sentinel() → updates sentiment context SECOND
+    3. run_morning_scan() → reads full context, uses dynamic threshold THIRD
+    """
+    print(f"[Main] Starting morning sequence at {now_wib().strftime('%H:%M')} WIB")
+
+    # Step 1: Radar — macro + geo context
+    try:
+        print("[Main] Step 1/3: Radar (macro + geo context)...")
+        run_radar()
+    except Exception as e:
+        log_error("Morning Sequence Radar", str(e), "run_morning_sequence")
+        print(f"[Main] Radar error in morning sequence: {e}")
+
+    # Step 2: Sentinel — news sentiment context
+    try:
+        print("[Main] Step 2/3: Sentinel (sentiment context)...")
+        run_sentinel()
+    except Exception as e:
+        log_error("Morning Sequence Sentinel", str(e), "run_morning_sequence")
+        print(f"[Main] Sentinel error in morning sequence: {e}")
+
+    # Step 3: Scanner — reads full context, dynamic threshold
+    run_morning_scan_with_tracker()
+
 
 def run_morning_scan_with_tracker():
     """Morning scan + log signals for accuracy tracking."""
@@ -211,8 +262,9 @@ MACRO_SHOCK_SLOTS = [
 for slot in MACRO_SHOCK_SLOTS:
     schedule.every().day.at(slot).do(safe_run_macro_shock)
 
-# ─── Morning scan (UTC 01:45 = WIB 08:45) ──────────────────────────────────
-schedule.every().day.at("01:45").do(safe_run, run_morning_scan_with_tracker, "Morning Scan + Tracker")
+# ─── Morning sequence (UTC 01:45 = WIB 08:45) ──────────────────────────────
+# CRITICAL: Radar → Sentinel → Scanner (in order, so Scanner gets full context)
+schedule.every().day.at("01:45").do(safe_run, run_morning_sequence, "Morning Sequence (Radar→Sentinel→Scan)")
 
 # ─── Market open commodity check (UTC 02:00 = WIB 09:00) ───────────────────
 schedule.every().day.at("02:00").do(safe_run, run_radar, "Radar (Market Open)")
@@ -431,7 +483,8 @@ def check_telegram_commands():
 def run_daemon():
     print(f"[Saham Scanner] Daemon started at {now_wib().strftime('%Y-%m-%d %H:%M')} WIB")
     print("[Saham Scanner] Schedule:")
-    print("  08:45 WIB - Morning Scan (macro + sector context)")
+    print("  08:45 WIB - Morning Sequence: Radar → Sentinel → Scanner (full context)")
+    print("  08:45 WIB - Shared Intelligence: agents saling connected via market context")
     print("  08:55-15:00 WIB - Macro shock check every 5 min")
     print("  08:55-15:00 WIB - Real-time every 10 min (Scanner + PositionTracker + SellScan)")
     print("  08:55-15:00 WIB - Position P&L update every 30 min")

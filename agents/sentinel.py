@@ -257,6 +257,89 @@ def run_sentinel():
         else:
             print("[Sentinel] No high/medium impact news")
 
+    # --- Shared Intelligence: update market context ---
+    try:
+        from agents.market_context import update_sentiment
+        _update_context_from_analyses(analyses, relevant)
+    except Exception as e:
+        print(f"[Sentinel] MarketContext sentiment update error: {e}")
+
+
+# Sector mapping for market context (ticker → sector)
+_TICKER_SECTOR_MAP = {
+    "BBCA.JK": "Perbankan", "BBRI.JK": "Perbankan",
+    "BMRI.JK": "Perbankan", "BBNI.JK": "Perbankan",
+    "TLKM.JK": "Telco", "EXCL.JK": "Telco",
+    "ANTM.JK": "Mining", "MDKA.JK": "Mining", "MEDC.JK": "Mining",
+    "GOTO.JK": "Tech", "BUKA.JK": "Tech",
+    "ASII.JK": "Industri", "AALI.JK": "Industri",
+    "UNVR.JK": "Consumer", "ICBP.JK": "Consumer", "INDF.JK": "Consumer",
+    "ADRO.JK": "Coal", "PTBA.JK": "Coal",
+    "SMGR.JK": "Semen", "INTP.JK": "Semen",
+    "AKRA.JK": "Oil", "ELSA.JK": "Oil",
+    "INCO.JK": "Mining", "ITMG.JK": "Coal",
+    "LSIP.JK": "Industri",
+}
+
+
+def _update_context_from_analyses(analyses: list, relevant: list):
+    """Extract dominant sentiment and update market context."""
+    from agents.market_context import update_sentiment
+
+    if not analyses:
+        # No analyses — keep neutral
+        update_sentiment("NETRAL", "SEDANG", [], [], "Tidak ada berita relevan")
+        return
+
+    # Filter to high-confidence, non-low-impact
+    significant = [
+        a for a in analyses
+        if a.get("dampak", a.get("level", "RENDAH")) != "RENDAH"
+        and a.get("confidence", "SEDANG") == "TINGGI"
+    ]
+
+    if not significant:
+        significant = analyses  # Fall back to all
+
+    # Count sentiments
+    counts = {"POSITIF": 0, "NEGATIF": 0, "NETRAL": 0}
+    for a in significant:
+        s = a.get("sentimen", "NETRAL")
+        if s in counts:
+            counts[s] += 1
+
+    # Dominant sentiment
+    dominant = max(counts, key=lambda k: counts[k])
+
+    # Most impactful article (TINGGI priority, then SEDANG)
+    def impact_order(a):
+        lvl = a.get("dampak", a.get("level", "RENDAH"))
+        return {"TINGGI": 0, "SEDANG": 1, "RENDAH": 2}.get(lvl, 2)
+
+    top = sorted(significant, key=impact_order)[0] if significant else {}
+
+    # Extract confidence
+    confidence = top.get("confidence", "SEDANG")
+
+    # Extract affected tickers from all significant articles
+    affected_tickers = []
+    for a in significant:
+        for t in a.get("saham", []):
+            ticker_jk = t + ".JK" if not t.endswith(".JK") else t
+            if ticker_jk not in affected_tickers:
+                affected_tickers.append(ticker_jk)
+
+    # Map tickers to sectors
+    affected_sectors = list({
+        _TICKER_SECTOR_MAP.get(t, _TICKER_SECTOR_MAP.get(t + ".JK", ""))
+        for t in affected_tickers
+        if _TICKER_SECTOR_MAP.get(t, _TICKER_SECTOR_MAP.get(t + ".JK", ""))
+    })
+
+    summary = top.get("ringkasan", top.get("analisa", ""))
+
+    update_sentiment(dominant, confidence, affected_sectors, affected_tickers, summary)
+
 
 if __name__ == "__main__":
     run_sentinel()
