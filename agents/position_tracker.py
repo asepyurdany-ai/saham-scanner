@@ -1,12 +1,15 @@
 """
 Position Tracker Agent — Track user stock positions
-Commands: /beli TICKER PRICE LOTS
+Commands: /beli TICKER PRICE LOTS  OR  /beli TICKER PRICE IDR_AMOUNT
+          /jual TICKER PRICE
 TP: +8%, CL: -4%, Trailing stop activates at +5%
 
-Usage: POST /beli BBCA 9000 5  (5 lots @ 9000)
+Usage: /beli BBCA 9000 5        (5 lots @ 9000)
+       /beli BBCA 9000 3000000  (IDR-based entry)
 Monitoring: every 10 min during market hours
 """
 
+import math
 import yfinance as yf
 import json
 import os
@@ -289,26 +292,308 @@ def monitor_positions(positions_file: str = DEFAULT_POSITIONS_FILE):
 def parse_beli_command(text: str) -> tuple:
     """
     Parse /beli command.
-    Format: /beli TICKER PRICE LOTS
+    Format: /beli TICKER PRICE LOTS  OR  /beli TICKER PRICE IDR_AMOUNT
     Returns: (ticker, price, lots) or None if invalid
+    Detection: if 4th arg > 50000 → treat as IDR, else treat as lots
     """
     parts = text.strip().split()
     if len(parts) < 4:
         return None
     try:
-        cmd, ticker, price, lots = parts[0], parts[1], parts[2], parts[3]
+        cmd, ticker, price, fourth = parts[0], parts[1], parts[2], parts[3]
         if cmd.lower() not in ["/beli", "beli"]:
             return None
-        return ticker.upper(), float(price), int(lots)
+        price_val = float(price)
+        fourth_val = float(fourth)
+        if fourth_val > 50000:
+            # IDR-based: calculate lots
+            lots = math.floor(fourth_val / (price_val * 100))
+        else:
+            lots = int(fourth_val)
+        return ticker.upper(), price_val, lots
     except (ValueError, IndexError):
         return None
+
+
+def parse_buy_command(text: str) -> dict:
+    """
+    Parse /beli command and return a structured dict.
+    - /beli BBCA 6070 3000000 → {ticker: "BBCA", price: 6070, total_idr: 3000000}
+    - /beli BBCA 6070 10 → {ticker: "BBCA", price: 6070, lots: 10}
+    Detection: if 4th arg > 50000 → treat as IDR, else treat as lots
+    Returns None if invalid.
+    """
+    parts = text.strip().split()
+    if len(parts) < 4:
+        return None
+    try:
+        cmd, ticker, price, fourth = parts[0], parts[1], parts[2], parts[3]
+        if cmd.lower() not in ["/beli", "beli"]:
+            return None
+        price_val = float(price)
+        fourth_val = float(fourth)
+        ticker = ticker.upper()
+        if fourth_val > 50000:
+            return {"ticker": ticker, "price": price_val, "total_idr": int(fourth_val)}
+        else:
+            return {"ticker": ticker, "price": price_val, "lots": int(fourth_val)}
+    except (ValueError, IndexError):
+        return None
+
+
+def add_position_idr(ticker: str, price: float, total_idr: int,
+                     positions: dict = None, positions_file: str = DEFAULT_POSITIONS_FILE) -> dict:
+    """
+    Add a position using IDR total amount.
+    lots = floor(total_idr / (price * 100))
+    Stores both lots AND total_idr fields.
+    Returns the position dict.
+    """
+    lots = math.floor(total_idr / (price * 100))
+    if lots < 1:
+        raise ValueError(f"Modal Rp{total_idr:,.0f} tidak cukup untuk membeli 1 lot {ticker} @ Rp{price:,.0f}")
+
+    actual_cost = lots * price * 100
+
+    if positions is None:
+        positions = load_positions(positions_file)
+
+    ticker = ticker.upper()
+    tp_price = price * (1 + TP_PCT)
+    cl_price = price * (1 + CL_PCT)
+
+    position = {
+        "ticker": ticker,
+        "entry_price": float(price),
+        "lots": int(lots),
+        "shares": int(lots) * 100,
+        "total_idr": int(total_idr),
+        "actual_cost": int(actual_cost),
+        "tp_price": round(tp_price, 0),
+        "cl_price": round(cl_price, 0),
+        "trailing_activated": False,
+        "trailing_stop": None,
+        "highest_price": float(price),
+        "current_price": float(price),
+        "pnl_pct": 0.0,
+        "pnl_rp": 0.0,
+        "added_at": datetime.utcnow().isoformat(),
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+
+    positions[ticker] = position
+    save_positions(positions, positions_file)
+    print(f"[PositionTracker] Added IDR {ticker}: {lots} lots @ Rp{price:,.0f} | Modal: Rp{actual_cost:,.0f} | TP: {tp_price:,.0f} | CL: {cl_price:,.0f}")
+    return position
+
+
+def _get_today_strong_buy_tickers(signals_file: str = "data/signals_today.json") -> set:
+    """Return set of tickers (without .JK) that are STRONG BUY today."""
+    try:
+        if not os.path.exists(signals_file):
+            return set()
+        with open(signals_file) as f:
+            data = json.load(f)
+        tickers = set()
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        # Accept signals regardless of date, or only today's
+        signals = data.get("signals", [])
+        for sig in signals:
+            if sig.get("signal") == "STRONG BUY":
+                ticker = sig.get("ticker", "")
+                # Strip .JK suffix
+                ticker = ticker.replace(".JK", "").upper()
+                tickers.add(ticker)
+        return tickers
+    except Exception as e:
+        print(f"[PositionTracker] Error reading signals: {e}")
+        return set()
+
+
+def close_position(ticker: str, sell_price: float,
+                   positions: dict = None, positions_file: str = DEFAULT_POSITIONS_FILE) -> dict:
+    """
+    Close an open position and calculate final P&L.
+    - Calculates profit_rp and profit_pct
+    - Marks position as closed
+    - Saves closed trade info (used by trade_journal)
+    - Sends Telegram close alert
+    Returns closed trade dict, or None if ticker not found.
+    """
+    if positions is None:
+        positions = load_positions(positions_file)
+
+    ticker = ticker.upper()
+    if ticker not in positions:
+        print(f"[PositionTracker] {ticker} not found in positions")
+        return None
+
+    pos = positions[ticker]
+    entry_price = pos["entry_price"]
+    lots = pos["lots"]
+    shares = pos["shares"]
+    entry_time_str = pos.get("added_at", datetime.utcnow().isoformat())
+    exit_time = datetime.utcnow()
+
+    # Parse entry time
+    try:
+        entry_time = datetime.fromisoformat(entry_time_str)
+    except Exception:
+        entry_time = exit_time
+
+    # P&L
+    profit_rp = round((sell_price - entry_price) * shares, 0)
+    profit_pct = round((sell_price - entry_price) / entry_price * 100, 2)
+
+    # Hold duration
+    hold_delta = exit_time - entry_time
+    hold_minutes = int(hold_delta.total_seconds() / 60)
+
+    # Format times in WIB
+    entry_wib = entry_time + timedelta(hours=7)
+    exit_wib = exit_time + timedelta(hours=7)
+
+    entry_fmt = entry_wib.strftime("%d %b %H:%M")
+    exit_fmt = exit_wib.strftime("%d %b %H:%M")
+
+    # Hold duration string
+    h = hold_minutes // 60
+    m = hold_minutes % 60
+    if h > 0:
+        hold_str = f"{h}j {m}m" if m > 0 else f"{h}j"
+    else:
+        hold_str = f"{m}m"
+
+    # Check if followed signal
+    strong_buy_tickers = _get_today_strong_buy_tickers()
+    followed_signal = ticker in strong_buy_tickers
+
+    # Signal score
+    signal_score = None
+    try:
+        if os.path.exists("data/signals_today.json"):
+            with open("data/signals_today.json") as f:
+                sig_data = json.load(f)
+            for sig in sig_data.get("signals", []):
+                if sig.get("ticker", "").replace(".JK", "").upper() == ticker:
+                    signal_score = sig.get("score")
+                    break
+    except Exception:
+        pass
+
+    # Modal
+    modal_idr = pos.get("actual_cost", pos.get("total_idr", int(entry_price * shares)))
+
+    # Build closed trade dict
+    closed_trade = {
+        "id": None,  # will be set by save_trade
+        "ticker": ticker,
+        "entry_price": entry_price,
+        "exit_price": float(sell_price),
+        "lots": lots,
+        "shares": shares,
+        "modal_idr": int(modal_idr),
+        "profit_rp": int(profit_rp),
+        "profit_pct": profit_pct,
+        "entry_time": entry_time.isoformat(),
+        "exit_time": exit_time.isoformat(),
+        "hold_minutes": hold_minutes,
+        "followed_signal": followed_signal,
+        "signal_score": signal_score,
+        "result": "WIN" if profit_rp > 0 else ("LOSS" if profit_rp < 0 else "NEUTRAL"),
+    }
+
+    # Remove from open positions
+    del positions[ticker]
+    save_positions(positions, positions_file)
+
+    # Telegram close alert
+    profit_sign = "+" if profit_rp >= 0 else ""
+    signal_line = f"🎯 vs Sinyal: SESUAI sinyal pagi ✅" if followed_signal else f"🎯 vs Sinyal: Di luar sinyal Dexter"
+
+    msg_lines = [
+        f"✅ <b>POSISI DITUTUP — {ticker}</b>",
+        "",
+        f"📍 Entry : Rp {entry_price:,.0f} ({entry_fmt})",
+        f"📤 Exit  : Rp {sell_price:,.0f} ({exit_fmt})",
+        f"📦 Lots  : {lots} lots ({shares:,} lembar)",
+        "",
+        f"💰 Profit: {profit_sign}Rp {abs(int(profit_rp)):,.0f} ({profit_sign}{profit_pct:.1f}%)",
+        f"⏱ Hold  : {hold_str}",
+        "",
+        signal_line,
+    ]
+    msg = "\n".join(msg_lines)
+    send_telegram(msg)
+
+    print(f"[PositionTracker] Closed {ticker}: {profit_sign}{profit_pct:.1f}% | {profit_sign}Rp{abs(int(profit_rp)):,.0f}")
+    return closed_trade
+
+
+def send_position_update(positions: dict = None, positions_file: str = DEFAULT_POSITIONS_FILE):
+    """
+    Send intraday P&L update for all open positions.
+    Called every 30 minutes during market hours.
+    """
+    if positions is None:
+        positions = load_positions(positions_file)
+
+    if not positions:
+        return
+
+    now_wib = datetime.utcnow() + timedelta(hours=7)
+    time_str = now_wib.strftime("%H:%M")
+
+    lines = [f"📊 <b>UPDATE POSISI — {time_str} WIB</b>", ""]
+
+    total_pnl_rp = 0
+
+    for ticker, pos in positions.items():
+        entry = pos["entry_price"]
+        current = pos.get("current_price", entry)
+        pnl_pct = pos.get("pnl_pct", 0)
+        pnl_rp = pos.get("pnl_rp", 0)
+        tp = pos.get("tp_price", entry * 1.08)
+        cl = pos.get("cl_price", entry * 0.96)
+
+        sign = "+" if pnl_pct >= 0 else ""
+        emoji = "🟢" if pnl_pct > 0 else "🔴" if pnl_pct < 0 else "⚪"
+
+        line = (
+            f"{emoji} <b>{ticker}</b>: Rp {entry:,.0f} → Rp {current:,.0f} "
+            f"| {sign}{pnl_pct:.1f}% | {sign}Rp {abs(int(pnl_rp)):,.0f}"
+        )
+        lines.append(line)
+
+        # TP/SL proximity hints
+        tp_distance_pct = ((tp - current) / current) * 100 if current > 0 else 0
+        if 0 < tp_distance_pct <= 1.0:
+            lines.append(f"      🎯 TP Intraday: Rp {tp:,.0f} (hampir!)")
+        elif tp_distance_pct > 0:
+            lines.append(f"      🎯 TP Intraday: Rp {tp:,.0f} (+{tp_distance_pct:.1f}%)")
+
+        trailing_stop = pos.get("trailing_stop")
+        if trailing_stop:
+            lines.append(f"      🔔 Trailing: Rp {trailing_stop:,.0f}")
+        else:
+            lines.append(f"      🛡 SL: Rp {cl:,.0f}")
+
+        total_pnl_rp += pnl_rp
+
+    lines.append("")
+    total_sign = "+" if total_pnl_rp >= 0 else ""
+    lines.append(f"💼 Total P&L hari ini: {total_sign}Rp {abs(int(total_pnl_rp)):,.0f}")
+
+    msg = "\n".join(lines)
+    send_telegram(msg)
+    print(f"[PositionTracker] Sent position update for {len(positions)} positions")
 
 
 def handle_beli_command(text: str, positions_file: str = DEFAULT_POSITIONS_FILE) -> str:
     """Handle /beli command, return response message."""
     result = parse_beli_command(text)
     if not result:
-        return "❌ Format salah. Gunakan: /beli TICKER HARGA LOT\nContoh: /beli BBCA 9000 5"
+        return "❌ Format salah. Gunakan: /beli TICKER HARGA LOT\nContoh: /beli BBCA 9000 5 atau /beli BBCA 9000 3000000"
 
     ticker, price, lots = result
     position = add_position(ticker, price, lots, positions_file=positions_file)

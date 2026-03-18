@@ -12,11 +12,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from agents.position_tracker import (
     add_position,
+    add_position_idr,
     update_position,
     check_tp_cl,
     format_position_alert,
     load_positions,
     save_positions,
+    parse_buy_command,
     TP_PCT,
     CL_PCT,
     TRAILING_ACTIVATE_PCT,
@@ -368,3 +370,112 @@ class TestFormatPositionAlert:
         msg = format_position_alert(pos, "TAKE_PROFIT")
 
         assert "+5.00" in msg or "+225" in msg or "5.00%" in msg
+
+
+# --- parse_buy_command Tests ---
+
+class TestParseBuyCommand:
+
+    def test_idr_detection(self):
+        """4th arg > 50000 → IDR-based command."""
+        result = parse_buy_command("/beli BBCA 6070 3000000")
+        assert result is not None
+        assert result["ticker"] == "BBCA"
+        assert result["price"] == 6070
+        assert "total_idr" in result
+        assert result["total_idr"] == 3000000
+        assert "lots" not in result
+
+    def test_lots_detection(self):
+        """4th arg <= 50000 → lots-based command."""
+        result = parse_buy_command("/beli BBCA 6070 10")
+        assert result is not None
+        assert result["ticker"] == "BBCA"
+        assert result["price"] == 6070
+        assert "lots" in result
+        assert result["lots"] == 10
+        assert "total_idr" not in result
+
+    def test_boundary_50000(self):
+        """Exactly 50000 → treated as lots."""
+        result = parse_buy_command("/beli BBCA 6070 50000")
+        assert result is not None
+        assert "lots" in result
+
+    def test_boundary_50001(self):
+        """50001 → treated as IDR."""
+        result = parse_buy_command("/beli BBCA 6070 50001")
+        assert result is not None
+        assert "total_idr" in result
+
+    def test_ticker_uppercase(self):
+        """Ticker should be uppercased."""
+        result = parse_buy_command("/beli bbca 6070 10")
+        assert result["ticker"] == "BBCA"
+
+    def test_invalid_command_returns_none(self):
+        """Non-/beli command should return None."""
+        result = parse_buy_command("/jual BBCA 7000")
+        assert result is None
+
+    def test_too_few_args_returns_none(self):
+        """Too few args should return None."""
+        result = parse_buy_command("/beli BBCA 6070")
+        assert result is None
+
+    def test_invalid_number_returns_none(self):
+        """Non-numeric price should return None."""
+        result = parse_buy_command("/beli BBCA abc 10")
+        assert result is None
+
+
+# --- add_position_idr Tests ---
+
+class TestAddPositionIdr:
+
+    def test_basic_idr_position(self, positions_file):
+        """add_position_idr should calculate lots correctly."""
+        positions = {}
+        pos = add_position_idr("BBCA", 6070, 3000000, positions=positions, positions_file=positions_file)
+
+        # lots = floor(3000000 / (6070 * 100)) = floor(4.94...) = 4
+        expected_lots = 4
+        assert pos["lots"] == expected_lots
+        assert pos["shares"] == expected_lots * 100
+
+    def test_actual_cost_stored(self, positions_file):
+        """actual_cost should be lots * price * 100."""
+        positions = {}
+        pos = add_position_idr("BBCA", 6070, 3000000, positions=positions, positions_file=positions_file)
+
+        expected_cost = pos["lots"] * 6070 * 100
+        assert pos["actual_cost"] == int(expected_cost)
+
+    def test_total_idr_stored(self, positions_file):
+        """total_idr input should be stored in position."""
+        positions = {}
+        pos = add_position_idr("BBCA", 6070, 3000000, positions=positions, positions_file=positions_file)
+        assert pos["total_idr"] == 3000000
+
+    def test_tp_cl_calculated(self, positions_file):
+        """TP and CL should be calculated from entry price."""
+        positions = {}
+        pos = add_position_idr("BBCA", 6070, 3000000, positions=positions, positions_file=positions_file)
+
+        expected_tp = round(6070 * (1 + TP_PCT), 0)
+        expected_cl = round(6070 * (1 + CL_PCT), 0)
+        assert pos["tp_price"] == expected_tp
+        assert pos["cl_price"] == expected_cl
+
+    def test_insufficient_capital_raises(self, positions_file):
+        """Very small IDR that can't buy 1 lot should raise ValueError."""
+        positions = {}
+        with pytest.raises(ValueError):
+            add_position_idr("BBCA", 6070, 100, positions=positions, positions_file=positions_file)
+
+    def test_persisted_to_file(self, positions_file):
+        """Position should be saved to file."""
+        add_position_idr("BBCA", 6070, 3000000, positions_file=positions_file)
+        loaded = load_positions(positions_file)
+        assert "BBCA" in loaded
+        assert loaded["BBCA"]["lots"] == 4

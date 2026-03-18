@@ -16,15 +16,30 @@ Error logging via SelfImprover.log_error on all agent failures.
 import time
 import schedule
 import threading
+import json
+import os
+import requests
 from datetime import datetime, timedelta
 from agents.scanner import (
     run_morning_scan, run_closing_report, run_realtime_scan, run_sell_scan
 )
 from agents.sentinel import run_sentinel
 from agents.radar import run_radar, run_macro_shock_check
-from agents.position_tracker import run_position_monitor
+from agents.position_tracker import (
+    run_position_monitor, send_position_update, load_positions,
+    add_position, add_position_idr, close_position, parse_buy_command,
+    format_portfolio_summary, DEFAULT_POSITIONS_FILE
+)
+from agents.trade_journal import save_trade, send_journal_summary, format_journal_report
 from agents.signal_tracker import log_signals_open, log_signals_close, send_weekly_accuracy_report
 from agents.self_improver import generate_improvement_report, log_error
+from dotenv import load_dotenv
+
+load_dotenv()
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "5922770410")
+TELEGRAM_OFFSET_FILE = "data/telegram_offset.json"
 
 
 def now_wib():
@@ -205,6 +220,213 @@ schedule.every().day.at("08:35").do(safe_run, run_closing_report_with_tracker, "
 schedule.every().day.at("08:40").do(safe_run, run_weekly_accuracy_report, "Weekly Accuracy Report")
 schedule.every().day.at("08:40").do(safe_run, run_weekly_improvement_report, "Weekly Improvement Report")
 
+# ─── Friday EOD: Journal summary (UTC 08:40 = WIB 15:40) ───────────────────
+schedule.every().day.at("08:40").do(safe_run, run_friday_journal, "Friday Journal Summary")
+
+# ─── Position P&L update every 30 min during market hours ──────────────────
+POSITION_UPDATE_SLOTS = [
+    "01:55", "02:25", "02:55", "03:25", "03:55",
+    "04:25", "04:55", "05:25", "05:55",
+    "06:25", "06:55", "07:25", "07:55",
+]
+for slot in POSITION_UPDATE_SLOTS:
+    schedule.every().day.at(slot).do(safe_run_position_update)
+
+
+def _send_telegram(msg: str):
+    """Send a Telegram message from main."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        resp = requests.post(url, json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": msg,
+            "parse_mode": "HTML"
+        }, timeout=10)
+        return resp.json().get("ok", False)
+    except Exception as e:
+        print(f"[Main] Telegram send error: {e}")
+        return False
+
+
+def _load_telegram_offset() -> int:
+    """Load last Telegram update offset."""
+    os.makedirs("data", exist_ok=True)
+    if os.path.exists(TELEGRAM_OFFSET_FILE):
+        try:
+            with open(TELEGRAM_OFFSET_FILE) as f:
+                return json.load(f).get("offset", 0)
+        except Exception:
+            pass
+    return 0
+
+
+def _save_telegram_offset(offset: int):
+    """Save Telegram update offset."""
+    os.makedirs("data", exist_ok=True)
+    with open(TELEGRAM_OFFSET_FILE, "w") as f:
+        json.dump({"offset": offset}, f)
+
+
+def _handle_telegram_command(text: str, chat_id: str):
+    """Handle a single Telegram command. Returns reply message."""
+    text = text.strip()
+    lower = text.lower()
+
+    try:
+        # /beli TICKER PRICE IDR_OR_LOTS
+        if lower.startswith("/beli"):
+            parsed = parse_buy_command(text)
+            if not parsed:
+                return "❌ Format: /beli TICKER HARGA LOT\nContoh: /beli BBCA 9000 5 atau /beli BBCA 9000 3000000"
+            ticker = parsed["ticker"]
+            price = parsed["price"]
+            if "total_idr" in parsed:
+                pos = add_position_idr(ticker, price, parsed["total_idr"])
+                lots = pos["lots"]
+                actual_cost = pos.get("actual_cost", price * lots * 100)
+                tp = pos["tp_price"]
+                cl = pos["cl_price"]
+                return (
+                    f"✅ <b>Posisi IDR ditambah: {ticker}</b>\n\n"
+                    f"📌 Entry: Rp {price:,.0f}\n"
+                    f"💰 Modal: Rp {parsed['total_idr']:,.0f} → {lots} lot (Rp {actual_cost:,.0f})\n"
+                    f"📦 {lots * 100:,} lembar\n"
+                    f"🎯 TP: Rp {tp:,.0f} (+8%)\n"
+                    f"🛑 CL: Rp {cl:,.0f} (-4%)\n\n"
+                    f"<i>Monitor otomatis setiap 10 menit jam pasar.</i>"
+                )
+            else:
+                lots = parsed["lots"]
+                from agents.position_tracker import add_position
+                pos = add_position(ticker, price, lots)
+                tp = pos["tp_price"]
+                cl = pos["cl_price"]
+                total_value = price * lots * 100
+                return (
+                    f"✅ <b>Posisi ditambah: {ticker}</b>\n\n"
+                    f"📌 Entry: Rp {price:,.0f}\n"
+                    f"📦 {lots} lot ({lots * 100:,} saham) = Rp {total_value:,.0f}\n"
+                    f"🎯 TP: Rp {tp:,.0f} (+8%)\n"
+                    f"🛑 CL: Rp {cl:,.0f} (-4%)\n\n"
+                    f"<i>Monitor otomatis setiap 10 menit jam pasar.</i>"
+                )
+
+        # /jual TICKER PRICE
+        elif lower.startswith("/jual"):
+            parts = text.split()
+            if len(parts) < 3:
+                return "❌ Format: /jual TICKER HARGA\nContoh: /jual BBCA 7010"
+            ticker = parts[1].upper()
+            try:
+                sell_price = float(parts[2])
+            except ValueError:
+                return "❌ Harga tidak valid."
+            closed = close_position(ticker, sell_price)
+            if closed is None:
+                return f"❌ Posisi {ticker} tidak ditemukan. Cek /posisi"
+            # Save to journal
+            save_trade(closed)
+            return f"✅ Trade {ticker} disimpan ke journal."
+
+        # /posisi
+        elif lower.startswith("/posisi"):
+            positions = load_positions(DEFAULT_POSITIONS_FILE)
+            return format_portfolio_summary(positions)
+
+        # /journal
+        elif lower.startswith("/journal"):
+            return format_journal_report()
+
+        # /help
+        elif lower.startswith("/help"):
+            return (
+                "🤖 <b>Dexter Commands</b>\n\n"
+                "/beli TICKER HARGA LOT — tambah posisi (lots)\n"
+                "/beli TICKER HARGA MODAL — tambah posisi (IDR)\n"
+                "/jual TICKER HARGA — tutup posisi & catat ke journal\n"
+                "/posisi — lihat portfolio terkini\n"
+                "/journal — lihat trading journal & statistik\n"
+                "/help — tampilkan perintah ini\n\n"
+                "<i>Contoh: /beli BBCA 6070 3000000</i>"
+            )
+
+    except Exception as e:
+        print(f"[Main] Command error: {e}")
+        log_error("TelegramCommand", str(e), text)
+        return f"⚠️ Error memproses perintah: {e}"
+
+    return None  # not a recognized command
+
+
+def check_telegram_commands():
+    """
+    Long-poll Telegram getUpdates and process commands.
+    Called in a background thread.
+    """
+    offset = _load_telegram_offset()
+
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+            params = {"offset": offset, "timeout": 30, "allowed_updates": ["message"]}
+            resp = requests.get(url, params=params, timeout=40)
+            data = resp.json()
+
+            if not data.get("ok"):
+                time.sleep(5)
+                continue
+
+            updates = data.get("result", [])
+            for update in updates:
+                update_id = update["update_id"]
+                offset = update_id + 1
+                _save_telegram_offset(offset)
+
+                msg = update.get("message", {})
+                text = msg.get("text", "")
+                chat_id = str(msg.get("chat", {}).get("id", ""))
+
+                if not text or not text.startswith("/"):
+                    continue
+
+                print(f"[Main] Telegram command: {text} from {chat_id}")
+                reply = _handle_telegram_command(text, chat_id)
+                if reply:
+                    _send_telegram(reply)
+
+        except requests.exceptions.Timeout:
+            # Normal for long-polling
+            pass
+        except Exception as e:
+            print(f"[Main] Telegram poll error: {e}")
+            time.sleep(10)
+
+
+def safe_run_position_update():
+    """Send 30-min position P&L update during market hours (only if positions exist)."""
+    if not is_market_day():
+        return
+    if not is_market_hours_utc():
+        return
+    try:
+        positions = load_positions(DEFAULT_POSITIONS_FILE)
+        if positions:
+            send_position_update(positions)
+    except Exception as e:
+        log_error("PositionUpdate", str(e), "safe_run_position_update")
+        print(f"[Main] Position update error: {e}")
+
+
+def run_friday_journal():
+    """Send journal summary on Fridays EOD."""
+    if now_wib().weekday() != 4:  # 4 = Friday
+        return
+    try:
+        send_journal_summary()
+    except Exception as e:
+        log_error("JournalSummary", str(e), "run_friday_journal")
+        print(f"[Main] Journal summary error: {e}")
+
 
 def run_daemon():
     print(f"[Saham Scanner] Daemon started at {now_wib().strftime('%Y-%m-%d %H:%M')} WIB")
@@ -212,11 +434,22 @@ def run_daemon():
     print("  08:45 WIB - Morning Scan (macro + sector context)")
     print("  08:55-15:00 WIB - Macro shock check every 5 min")
     print("  08:55-15:00 WIB - Real-time every 10 min (Scanner + PositionTracker + SellScan)")
+    print("  08:55-15:00 WIB - Position P&L update every 30 min")
     print("  09:00+ WIB - Sentinel & Radar checks")
     print("  15:35 WIB - Closing delta report (EOD format)")
-    print("  15:40 WIB (Fri) - Weekly accuracy + improvement report")
+    print("  15:40 WIB (Fri) - Weekly accuracy + improvement report + journal")
     print("[Saham Scanner] Self-healing: agents auto-restart on failure")
     print("[Saham Scanner] Error logging: via SelfImprover.log_error")
+    print("[Saham Scanner] Telegram command handler: starting background thread")
+
+    # Start Telegram command handler in background thread
+    telegram_thread = threading.Thread(
+        target=check_telegram_commands,
+        name="TelegramCommandHandler",
+        daemon=True
+    )
+    telegram_thread.start()
+    print(f"[Saham Scanner] Telegram command handler running (thread: {telegram_thread.name})")
 
     while True:
         try:
@@ -252,7 +485,12 @@ if __name__ == "__main__":
             generate_improvement_report()
         elif cmd == "daemon":
             run_daemon()
+        elif cmd == "journal":
+            send_journal_summary()
+        elif cmd == "positions_update":
+            positions = load_positions(DEFAULT_POSITIONS_FILE)
+            send_position_update(positions)
         else:
-            print("Usage: python main.py [scan|close|sentinel|radar|realtime|sell|macro|positions|weekly|improve|daemon]")
+            print("Usage: python main.py [scan|close|sentinel|radar|realtime|sell|macro|positions|positions_update|weekly|improve|journal|daemon]")
     else:
         run_daemon()
