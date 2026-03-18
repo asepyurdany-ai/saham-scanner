@@ -195,26 +195,27 @@ class TestComputeSignals:
         if result:
             assert 0 <= result["rsi"] <= 100
 
-    def test_conditions_dict_has_6_keys(self):
-        """conditions dict should have exactly 6 boolean keys."""
+    def test_conditions_dict_has_7_keys(self):
+        """conditions dict should have exactly 7 boolean keys (including foreign_net_buy)."""
         df = make_buy_df()
         result = compute_signals("BBCA.JK", df)
         if result:
-            assert len(result["conditions"]) == 6, (
-                f"Expected 6 conditions, got {len(result['conditions'])}: "
+            assert len(result["conditions"]) == 7, (
+                f"Expected 7 conditions, got {len(result['conditions'])}: "
                 f"{list(result['conditions'].keys())}"
             )
             for v in result["conditions"].values():
                 assert isinstance(v, bool)
 
     def test_conditions_keys(self):
-        """conditions dict should have the correct 6 named keys."""
+        """conditions dict should have the correct 7 named keys."""
         df = make_buy_df()
         result = compute_signals("BBCA.JK", df)
         if result:
             expected_keys = {
                 "uptrend", "volume_spike", "rsi_ok",
-                "price_above_ma20", "macd_bullish", "momentum_positive"
+                "price_above_ma20", "macd_bullish", "momentum_positive",
+                "foreign_net_buy",
             }
             assert set(result["conditions"].keys()) == expected_keys
 
@@ -532,12 +533,12 @@ class TestFormatMorningAlert:
         assert "TP" in msg
         assert "SL" in msg
 
-    def test_format_score_out_of_6(self):
-        """format_morning_alert should show score as X/6."""
+    def test_format_score_out_of_7(self):
+        """format_morning_alert should show threshold as X/7 in header (7 total conditions)."""
         signals = [self._make_signal("BBCA.JK", "STRONG BUY", 5)]
         msg = format_morning_alert(signals)
 
-        assert "5/6" in msg
+        assert "5/7" in msg
 
 
 # ─── Tests: classify_trading_style ──────────────────────────────────────────
@@ -907,3 +908,75 @@ class TestFormatSellAlert:
         signals = [self._make_strong_sell()]
         msg = format_sell_alert(signals)
         assert "BUKAN saran investasi" in msg or "DYOR" in msg
+
+
+# ─── Tests: Foreign Flow condition (Condition 7) ────────────────────────────
+
+class TestForeignFlowCondition:
+
+    def test_foreign_net_buy_true_when_net_positive(self):
+        """foreign_net_buy condition should be True when net_foreign > 0."""
+        df = make_buy_df()
+        foreign_flow = {
+            "BBCA": {"foreign_buy": 5_000_000, "foreign_sell": 2_000_000, "net_foreign": 3_000_000}
+        }
+        result = compute_signals("BBCA.JK", df, foreign_flow=foreign_flow)
+        assert result is not None
+        assert result["conditions"]["foreign_net_buy"] is True
+
+    def test_foreign_net_buy_false_when_net_negative(self):
+        """foreign_net_buy condition should be False when net_foreign < 0."""
+        df = make_buy_df()
+        foreign_flow = {
+            "BBCA": {"foreign_buy": 1_000_000, "foreign_sell": 3_000_000, "net_foreign": -2_000_000}
+        }
+        result = compute_signals("BBCA.JK", df, foreign_flow=foreign_flow)
+        assert result is not None
+        assert result["conditions"]["foreign_net_buy"] is False
+
+    def test_foreign_net_buy_false_when_no_flow_data(self):
+        """foreign_net_buy should be False when foreign_flow is None."""
+        df = make_buy_df()
+        result = compute_signals("BBCA.JK", df, foreign_flow=None)
+        assert result is not None
+        assert result["conditions"]["foreign_net_buy"] is False
+
+    def test_foreign_net_buy_false_when_empty_flow_dict(self):
+        """foreign_net_buy should be False when foreign_flow is empty."""
+        df = make_buy_df()
+        result = compute_signals("BBCA.JK", df, foreign_flow={})
+        assert result is not None
+        assert result["conditions"]["foreign_net_buy"] is False
+
+    def test_foreign_flow_strips_jk_suffix(self):
+        """Should handle BBCA.JK → BBCA lookup in flow_data."""
+        df = make_buy_df()
+        foreign_flow = {
+            "BBCA": {"foreign_buy": 5_000_000, "foreign_sell": 2_000_000, "net_foreign": 3_000_000}
+        }
+        result = compute_signals("BBCA.JK", df, foreign_flow=foreign_flow)
+        assert result is not None
+        assert result["conditions"]["foreign_net_buy"] is True
+
+    def test_score_increases_with_foreign_buy(self):
+        """Score should be higher when foreign_net_buy is True."""
+        df = make_buy_df()
+        result_no_foreign = compute_signals("BBCA.JK", df, foreign_flow=None)
+        foreign_flow = {
+            "BBCA": {"foreign_buy": 5_000_000, "foreign_sell": 0, "net_foreign": 5_000_000}
+        }
+        result_with_foreign = compute_signals("BBCA.JK", df, foreign_flow=foreign_flow)
+        assert result_no_foreign is not None
+        assert result_with_foreign is not None
+        # Score with foreign buy should be >= score without
+        assert result_with_foreign["score"] >= result_no_foreign["score"]
+
+    def test_max_score_is_7(self):
+        """Maximum possible score should be 7 (all conditions True)."""
+        df = make_buy_df()
+        foreign_flow = {
+            "BBCA": {"foreign_buy": 5_000_000, "foreign_sell": 0, "net_foreign": 5_000_000}
+        }
+        result = compute_signals("BBCA.JK", df, foreign_flow=foreign_flow)
+        assert result is not None
+        assert result["score"] <= 7

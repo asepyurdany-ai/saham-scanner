@@ -177,6 +177,7 @@ def validate_signal(signal: dict, ctx: dict) -> tuple:
         (is_valid: bool, reason: str)
 
     Rules:
+    - market_gate CLOSED → False (blocks ALL buy signals)
     - RISK_OFF + score < 6 → False
     - macro_shock_active + score < 6 → False
     - geo risk HIGH → True with warning
@@ -190,18 +191,25 @@ def validate_signal(signal: dict, ctx: dict) -> tuple:
     macro_shock = ctx.get("macro", {}).get("macro_shock_active", False)
     geo_risk = ctx.get("geo", {}).get("risk_level", "LOW")
 
+    # Gap 2: Market gate CLOSED blocks ALL buy signals
+    market_gate = ctx.get("market_gate", "OPEN")
+    if market_gate == "CLOSED":
+        return False, "Market gate CLOSED — pasar lemah, tahan semua BUY"
+
     if market_mode == "RISK_OFF" and score < 6:
-        return False, f"RISK_OFF mode aktif — butuh skor 6/6 (saat ini {score}/6)"
+        return False, f"RISK_OFF mode aktif — butuh skor 6/6 (saat ini {score}/7)"
 
     if macro_shock and score < 6:
-        return False, f"Macro shock aktif — butuh skor 6/6 (saat ini {score}/6)"
+        return False, f"Macro shock aktif — butuh skor 6/6 (saat ini {score}/7)"
 
     if geo_risk == "HIGH":
-        return True, f"⚠️ Geo Risk HIGH — hati-hati, konfirmasi ekstra diperlukan"
+        return True, "⚠️ Geo Risk HIGH — hati-hati, konfirmasi ekstra diperlukan"
 
     reasons = []
     if market_mode == "CAUTIOUS":
         reasons.append("mode CAUTIOUS")
+    if market_gate == "CAUTIOUS":
+        reasons.append("gate CAUTIOUS — threshold dinaikkan")
     if market_mode == "RISK_ON":
         reasons.append("mode RISK_ON — momentum bagus")
 
@@ -209,10 +217,16 @@ def validate_signal(signal: dict, ctx: dict) -> tuple:
     return True, reason
 
 
-def compute_signals(ticker: str, df: pd.DataFrame, ctx: dict = None, threshold: int = None) -> dict:
+def compute_signals(
+    ticker: str,
+    df: pd.DataFrame,
+    ctx: dict = None,
+    threshold: int = None,
+    foreign_flow: dict = None,
+) -> dict:
     """
     Compute technical signals.
-    Hedge fund rule: need 5/6 conditions for STRONG BUY (dynamic threshold).
+    Hedge fund rule: need 5/7 conditions for STRONG BUY (dynamic threshold).
 
     Conditions:
       1. Trend naik: MA20 > MA50
@@ -221,9 +235,10 @@ def compute_signals(ticker: str, df: pd.DataFrame, ctx: dict = None, threshold: 
       4. Price above MA20
       5. MACD bullish (MACD line > Signal line OR crossover in last 3 candles)
       6. Momentum: daily change > 0%
+      7. Foreign net buy (asing beli neto)
 
     Signal levels:
-      STRONG BUY: score 5-6
+      STRONG BUY: score >= threshold (default 5/7)
       WATCH:      score 3-4
       AVOID:      score < 3
     """
@@ -303,14 +318,24 @@ def compute_signals(ticker: str, df: pd.DataFrame, ctx: dict = None, threshold: 
     tp_pct = 8.0
     sl_pct = -4.0
 
-    # === 6 CONDITIONS ===
+    # === 7 CONDITIONS (including foreign flow) ===
+    # Condition 7: Foreign net buy
+    foreign_net_buy = False
+    if foreign_flow:
+        clean_ticker = ticker.replace(".JK", "").upper()
+        flow = foreign_flow.get(clean_ticker, {})
+        net = float(flow.get("net_foreign", 0))
+        if net > 0:
+            foreign_net_buy = True
+
     conditions = {
-        "uptrend":          bool(ma20 > ma50),
-        "volume_spike":     bool(vol_ratio >= 2.0),
-        "rsi_ok":           bool(rsi > 25 and rsi < 70),
-        "price_above_ma20": bool(current > ma20),
-        "macd_bullish":     bool(macd_bullish),
+        "uptrend":           bool(ma20 > ma50),
+        "volume_spike":      bool(vol_ratio >= 2.0),
+        "rsi_ok":            bool(rsi > 25 and rsi < 70),
+        "price_above_ma20":  bool(current > ma20),
+        "macd_bullish":      bool(macd_bullish),
         "momentum_positive": bool(daily_change_pct > 0),
+        "foreign_net_buy":   bool(foreign_net_buy),
     }
 
     score = sum(conditions.values())
@@ -341,9 +366,33 @@ def compute_signals(ticker: str, df: pd.DataFrame, ctx: dict = None, threshold: 
             sentiment_sectors = ctx["sentiment"].get("affected_sectors", [])
             news_sentiment = ctx["sentiment"].get("news_sentiment", "NETRAL")
             if ticker_sector in sentiment_sectors and news_sentiment == "NEGATIF":
-                buy_threshold = min(buy_threshold + 1, 6)
+                buy_threshold = min(buy_threshold + 1, 7)
         except Exception:
             pass
+
+    # Gap 2: Market gate CAUTIOUS → threshold +1
+    if ctx:
+        try:
+            market_gate = ctx.get("market_gate", "OPEN")
+            if market_gate == "CAUTIOUS":
+                buy_threshold = min(buy_threshold + 1, 7)
+        except Exception:
+            pass
+
+    # Gap 3: Premarket prediction NEGATIF → threshold +1
+    if ctx:
+        try:
+            premarket = ctx.get("premarket", {})
+            prediction = premarket.get("ihsg_open_prediction", "NETRAL")
+            if prediction == "NEGATIF":
+                buy_threshold = min(buy_threshold + 1, 7)
+        except Exception:
+            pass
+
+    # If no foreign flow data available, cap threshold at 6 (max non-foreign score).
+    # Spec: "5/7 ideally, but 5/6 still valid if foreign data unavailable"
+    if not foreign_flow:
+        buy_threshold = min(buy_threshold, 6)
 
     # Signal levels
     if score >= buy_threshold:
@@ -478,28 +527,81 @@ def scan_all() -> list:
         from agents.market_context import get_context, get_dynamic_threshold
         ctx = get_context()
         threshold = get_dynamic_threshold()
-        print(f"[Scanner] Market mode: {ctx.get('market_mode', 'NORMAL')}, threshold: {threshold}/6")
+        print(f"[Scanner] Market mode: {ctx.get('market_mode', 'NORMAL')}, threshold: {threshold}/7")
     except Exception as e:
         print(f"[Scanner] Could not load market context: {e}")
+
+    # Gap 1: Fetch foreign flow ONCE for all tickers
+    foreign_flow = {}
+    try:
+        from agents.foreign_flow import fetch_foreign_flow, save_flow_data
+        from agents.market_context import update_foreign_flow
+        foreign_flow = fetch_foreign_flow()
+        if foreign_flow:
+            save_flow_data(foreign_flow)
+            # Compute overall foreign signal for context
+            watchlist_clean = [t.replace(".JK", "") for t in WATCHLIST]
+            net_values = [
+                foreign_flow[t]["net_foreign"]
+                for t in watchlist_clean
+                if t in foreign_flow
+            ]
+            if net_values:
+                avg_net = sum(net_values) / len(net_values)
+                if avg_net > 0:
+                    ff_signal = "BULLISH"
+                elif avg_net < 0:
+                    ff_signal = "BEARISH"
+                else:
+                    ff_signal = "NEUTRAL"
+                top_bought = sorted(
+                    [t for t in watchlist_clean if t in foreign_flow and foreign_flow[t]["net_foreign"] > 0],
+                    key=lambda t: -foreign_flow[t]["net_foreign"],
+                )[:3]
+                top_sold = sorted(
+                    [t for t in watchlist_clean if t in foreign_flow and foreign_flow[t]["net_foreign"] < 0],
+                    key=lambda t: foreign_flow[t]["net_foreign"],
+                )[:3]
+                update_foreign_flow(ff_signal, top_bought, top_sold)
+    except Exception as e:
+        print(f"[Scanner] Foreign flow fetch error: {e}")
+
+    # Gap 2: Calculate breadth after scanning (use results from previous scan if available)
+    # Breadth will be calculated after the loop with fresh results
 
     for ticker in WATCHLIST:
         try:
             df = get_stock_data(ticker)
-            signal = compute_signals(ticker, df, ctx=ctx, threshold=threshold)
+            signal = compute_signals(ticker, df, ctx=ctx, threshold=threshold, foreign_flow=foreign_flow)
             if signal:
                 results.append(signal)
+                ff_tag = "✅" if signal["conditions"].get("foreign_net_buy") else "❌"
                 print(f"  {ticker}: {signal['signal']} (score={signal['score']}/{signal.get('buy_threshold', 5)}, "
                       f"RSI={signal['rsi']}, vol={signal['vol_ratio']}x, "
-                      f"MACD={'✅' if signal['macd_bullish'] else '❌'})")
+                      f"MACD={'✅' if signal['macd_bullish'] else '❌'}, "
+                      f"Asing={ff_tag})")
         except Exception as e:
             print(f"[Scanner] Error processing {ticker}: {e}")
+
+    # Gap 2: Calculate breadth from fresh scan results
+    try:
+        from agents.market_breadth import calculate_breadth, fetch_ihsg_data, check_market_gate
+        from agents.market_context import update_market_breadth
+        breadth = calculate_breadth(results)
+        ihsg_data = fetch_ihsg_data()
+        gate = check_market_gate(ihsg_data, breadth)
+        ihsg_change = ihsg_data.get("change_from_open_pct", 0) if ihsg_data else 0
+        update_market_breadth(gate["gate"], breadth["breadth_pct"], ihsg_change)
+        print(f"[Scanner] Market gate: {gate['gate']}, breadth: {breadth['breadth_pct']:.0f}%")
+    except Exception as e:
+        print(f"[Scanner] Market breadth calculation error: {e}")
 
     # Sort: STRONG BUY first, then WATCH, then by score
     results.sort(key=lambda x: (-x["score"], x["signal"]))
     return results
 
 
-def format_morning_alert(signals: list, macro: dict = None, market_context: str = None) -> str:
+def format_morning_alert(signals: list, macro: dict = None, market_context: str = None, foreign_flow: dict = None) -> str:
     """Format morning briefing Telegram message with macro + trade setup + market context"""
     strong_buy_signals = [s for s in signals if s["signal"] == "STRONG BUY"]
     watch_signals = [s for s in signals if s["signal"] == "WATCH"]
@@ -526,7 +628,7 @@ def format_morning_alert(signals: list, macro: dict = None, market_context: str 
 
     lines = [
         f"🏦 <b>MORNING SCAN — {now_wib.strftime('%d %b %Y %H:%M')} WIB</b>",
-        f"<i>Hedge fund mode: {mode_label} | STRONG BUY threshold: {threshold}/6</i>",
+        f"<i>Hedge fund mode: {mode_label} | STRONG BUY threshold: {threshold}/7</i>",
         "",
     ]
 
@@ -578,6 +680,18 @@ def format_morning_alert(signals: list, macro: dict = None, market_context: str 
             lines.append(
                 f"📊 RSI {s['rsi']} | Vol {s['vol_ratio']}x | MACD {macd_tag} | MA {ma_tag}"
             )
+
+            # Gap 1: Foreign flow line
+            if foreign_flow:
+                clean_t = s["ticker"].replace(".JK", "").upper()
+                flow = foreign_flow.get(clean_t, {})
+                net = flow.get("net_foreign", 0)
+                if net != 0:
+                    net_juta = net / 1_000_000
+                    if net > 0:
+                        lines.append(f"🏦 Asing: Net Buy Rp {net_juta:.1f} juta ✅")
+                    else:
+                        lines.append(f"🏦 Asing: Net Sell Rp {abs(net_juta):.1f} juta ⚠️")
 
             # Context lines for this ticker's sector
             if ctx:
@@ -962,7 +1076,18 @@ def run_morning_scan():
     except Exception as e:
         print(f"[Scanner] Claude context error: {e}")
 
-    msg = format_morning_alert(signals, macro, market_context)
+    # Load foreign flow data for alert enrichment
+    foreign_flow = {}
+    try:
+        flow_path = "data/foreign_flow_today.json"
+        if os.path.exists(flow_path):
+            with open(flow_path) as f:
+                flow_data = json.load(f)
+            foreign_flow = flow_data.get("data", {})
+    except Exception as e:
+        print(f"[Scanner] Foreign flow load error: {e}")
+
+    msg = format_morning_alert(signals, macro, market_context, foreign_flow=foreign_flow)
     ok = send_telegram(msg)
     print(f"[Scanner] Morning alert sent: {ok}")
     return signals

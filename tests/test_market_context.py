@@ -20,6 +20,9 @@ from agents.market_context import (
     update_sentiment,
     update_geo,
     update_performance,
+    update_foreign_flow,
+    update_market_breadth,
+    update_premarket,
     compute_market_mode,
     get_dynamic_threshold,
     get_context,
@@ -545,3 +548,176 @@ class TestGetContext:
     def test_no_crash_when_file_missing(self):
         result = get_context()
         assert result["market_mode"] == "NORMAL"
+
+
+# ─── test_new_default_context_fields ─────────────────────────────────────────
+
+class TestNewDefaultContextFields:
+
+    def test_default_has_foreign_flow_key(self):
+        ctx = load_context()
+        assert "foreign_flow" in ctx
+
+    def test_default_has_market_gate_key(self):
+        ctx = load_context()
+        assert "market_gate" in ctx
+
+    def test_default_has_premarket_key(self):
+        ctx = load_context()
+        assert "premarket" in ctx
+
+    def test_default_market_gate_is_open(self):
+        ctx = load_context()
+        assert ctx["market_gate"] == "OPEN"
+
+    def test_default_foreign_flow_signal_neutral(self):
+        ctx = load_context()
+        assert ctx["foreign_flow"]["foreign_flow_signal"] == "NEUTRAL"
+
+    def test_default_premarket_prediction_netral(self):
+        ctx = load_context()
+        assert ctx["premarket"]["ihsg_open_prediction"] == "NETRAL"
+
+    def test_default_foreign_flow_keys(self):
+        ctx = load_context()
+        ff = ctx["foreign_flow"]
+        assert "foreign_flow_signal" in ff
+        assert "top_bought" in ff
+        assert "top_sold" in ff
+
+    def test_default_premarket_keys(self):
+        ctx = load_context()
+        pm = ctx["premarket"]
+        assert "us_signal" in pm
+        assert "asia_signal" in pm
+        assert "ihsg_open_prediction" in pm
+
+    def test_default_market_breadth_keys(self):
+        ctx = load_context()
+        mb = ctx["market_breadth"]
+        assert "breadth_pct" in mb
+        assert "ihsg_change_from_open" in mb
+
+
+# ─── test_update_foreign_flow ────────────────────────────────────────────────
+
+class TestUpdateForeignFlow:
+
+    def test_updates_foreign_flow_signal(self):
+        update_foreign_flow("BULLISH", ["BBCA", "BBRI"], ["GOTO"])
+        ctx = load_context()
+        assert ctx["foreign_flow"]["foreign_flow_signal"] == "BULLISH"
+
+    def test_updates_top_bought(self):
+        update_foreign_flow("BULLISH", ["BBCA", "BBRI"], [])
+        ctx = load_context()
+        assert "BBCA" in ctx["foreign_flow"]["top_bought"]
+        assert "BBRI" in ctx["foreign_flow"]["top_bought"]
+
+    def test_updates_top_sold(self):
+        update_foreign_flow("BEARISH", [], ["GOTO", "BUKA"])
+        ctx = load_context()
+        assert "GOTO" in ctx["foreign_flow"]["top_sold"]
+
+    def test_accepts_neutral_signal(self):
+        update_foreign_flow("NEUTRAL", [], [])
+        ctx = load_context()
+        assert ctx["foreign_flow"]["foreign_flow_signal"] == "NEUTRAL"
+
+    def test_persists_to_file(self, patch_context_file):
+        update_foreign_flow("BULLISH", ["BBCA"], [])
+        assert os.path.exists(patch_context_file)
+        with open(patch_context_file) as f:
+            data = json.load(f)
+        assert data["foreign_flow"]["foreign_flow_signal"] == "BULLISH"
+
+    def test_empty_lists_allowed(self):
+        """Empty lists should not raise."""
+        update_foreign_flow("NEUTRAL", [], [])
+        ctx = load_context()
+        assert ctx["foreign_flow"]["top_bought"] == []
+        assert ctx["foreign_flow"]["top_sold"] == []
+
+
+# ─── test_update_market_breadth ──────────────────────────────────────────────
+
+class TestUpdateMarketBreadth:
+
+    def test_updates_market_gate(self):
+        update_market_breadth("CAUTIOUS", 45.0, -0.8)
+        ctx = load_context()
+        assert ctx["market_gate"] == "CAUTIOUS"
+
+    def test_updates_breadth_pct(self):
+        update_market_breadth("OPEN", 67.5, 0.3)
+        ctx = load_context()
+        assert ctx["market_breadth"]["breadth_pct"] == 67.5
+
+    def test_updates_ihsg_change(self):
+        update_market_breadth("CLOSED", 28.0, -1.8)
+        ctx = load_context()
+        assert ctx["market_breadth"]["ihsg_change_from_open"] == -1.8
+
+    def test_gate_closed(self):
+        update_market_breadth("CLOSED", 25.0, -2.0)
+        ctx = load_context()
+        assert ctx["market_gate"] == "CLOSED"
+
+    def test_gate_open(self):
+        update_market_breadth("OPEN", 70.0, 0.5)
+        ctx = load_context()
+        assert ctx["market_gate"] == "OPEN"
+
+    def test_persists_to_file(self, patch_context_file):
+        update_market_breadth("CAUTIOUS", 42.0, -0.6)
+        assert os.path.exists(patch_context_file)
+        with open(patch_context_file) as f:
+            data = json.load(f)
+        assert data["market_gate"] == "CAUTIOUS"
+        assert data["market_breadth"]["breadth_pct"] == 42.0
+
+
+# ─── test_update_premarket ────────────────────────────────────────────────────
+
+class TestUpdatePremarket:
+
+    def test_updates_us_signal(self):
+        update_premarket("BULLISH", "NEUTRAL", "POSITIF")
+        ctx = load_context()
+        assert ctx["premarket"]["us_signal"] == "BULLISH"
+
+    def test_updates_asia_signal(self):
+        update_premarket("NEUTRAL", "BEARISH", "NETRAL")
+        ctx = load_context()
+        assert ctx["premarket"]["asia_signal"] == "BEARISH"
+
+    def test_updates_prediction(self):
+        update_premarket("BULLISH", "BULLISH", "POSITIF")
+        ctx = load_context()
+        assert ctx["premarket"]["ihsg_open_prediction"] == "POSITIF"
+
+    def test_accepts_negatif_prediction(self):
+        update_premarket("BEARISH", "BEARISH", "NEGATIF")
+        ctx = load_context()
+        assert ctx["premarket"]["ihsg_open_prediction"] == "NEGATIF"
+
+    def test_accepts_netral_prediction(self):
+        update_premarket("NEUTRAL", "NEUTRAL", "NETRAL")
+        ctx = load_context()
+        assert ctx["premarket"]["ihsg_open_prediction"] == "NETRAL"
+
+    def test_persists_to_file(self, patch_context_file):
+        update_premarket("BEARISH", "NEUTRAL", "NEGATIF")
+        assert os.path.exists(patch_context_file)
+        with open(patch_context_file) as f:
+            data = json.load(f)
+        assert data["premarket"]["us_signal"] == "BEARISH"
+        assert data["premarket"]["ihsg_open_prediction"] == "NEGATIF"
+
+    def test_multiple_updates_accumulate(self):
+        """Multiple premarket updates should persist the latest."""
+        update_premarket("BULLISH", "BULLISH", "POSITIF")
+        update_premarket("BEARISH", "BEARISH", "NEGATIF")
+        ctx = load_context()
+        assert ctx["premarket"]["us_signal"] == "BEARISH"
+        assert ctx["premarket"]["ihsg_open_prediction"] == "NEGATIF"

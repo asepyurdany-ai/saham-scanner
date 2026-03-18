@@ -47,6 +47,24 @@ DEFAULT_CONTEXT = {
         "macd_weight": 1.0,
         "volume_weight": 1.0,
     },
+    # Gap 1: Foreign institutional flow
+    "foreign_flow": {
+        "foreign_flow_signal": "NEUTRAL",  # BULLISH | NEUTRAL | BEARISH
+        "top_bought": [],
+        "top_sold": [],
+    },
+    # Gap 2: Market breadth gate
+    "market_gate": "OPEN",  # OPEN | CAUTIOUS | CLOSED
+    "market_breadth": {
+        "breadth_pct": 50.0,
+        "ihsg_change_from_open": 0.0,
+    },
+    # Gap 3: Pre-market global context
+    "premarket": {
+        "us_signal": "NEUTRAL",       # BULLISH | NEUTRAL | BEARISH
+        "asia_signal": "NEUTRAL",     # BULLISH | NEUTRAL | BEARISH
+        "ihsg_open_prediction": "NETRAL",  # POSITIF | NETRAL | NEGATIF
+    },
 }
 
 # Module-level lock for thread safety
@@ -256,6 +274,69 @@ def get_context() -> dict:
     ctx = load_context()
     ctx["market_mode"] = compute_market_mode(ctx)
     return ctx
+
+
+def update_foreign_flow(signal: str, top_bought: list, top_sold: list):
+    """
+    Update foreign institutional flow signal and persist.
+    Called by scanner after fetch_foreign_flow().
+
+    Args:
+        signal: "BULLISH" | "NEUTRAL" | "BEARISH"
+        top_bought: list of tickers with highest net foreign buy
+        top_sold: list of tickers with highest net foreign sell
+    """
+    ctx = load_context()
+    ctx["foreign_flow"]["foreign_flow_signal"] = str(signal)
+    ctx["foreign_flow"]["top_bought"] = list(top_bought)
+    ctx["foreign_flow"]["top_sold"] = list(top_sold)
+    save_context(ctx)
+    print(
+        f"[MarketContext] Foreign flow updated: signal={signal}, "
+        f"top_bought={top_bought[:3]}, top_sold={top_sold[:3]}"
+    )
+
+
+def update_market_breadth(gate: str, breadth_pct: float, ihsg_change: float):
+    """
+    Update market gate and breadth data, persist.
+    Called by market_breadth agent every 30 min.
+
+    Args:
+        gate: "OPEN" | "CAUTIOUS" | "CLOSED"
+        breadth_pct: percentage of advancing stocks (0-100)
+        ihsg_change: IHSG change from open in percent
+    """
+    ctx = load_context()
+    ctx["market_gate"] = str(gate)
+    ctx["market_breadth"]["breadth_pct"] = float(breadth_pct)
+    ctx["market_breadth"]["ihsg_change_from_open"] = float(ihsg_change)
+    save_context(ctx)
+    print(
+        f"[MarketContext] Market breadth updated: gate={gate}, "
+        f"breadth={breadth_pct:.1f}%, ihsg_change={ihsg_change:+.2f}%"
+    )
+
+
+def update_premarket(us_signal: str, asia_signal: str, prediction: str):
+    """
+    Update pre-market global market context and persist.
+    Called by premarket agent at 07:00 WIB.
+
+    Args:
+        us_signal: "BULLISH" | "NEUTRAL" | "BEARISH"
+        asia_signal: "BULLISH" | "NEUTRAL" | "BEARISH"
+        prediction: "POSITIF" | "NETRAL" | "NEGATIF"
+    """
+    ctx = load_context()
+    ctx["premarket"]["us_signal"] = str(us_signal)
+    ctx["premarket"]["asia_signal"] = str(asia_signal)
+    ctx["premarket"]["ihsg_open_prediction"] = str(prediction)
+    save_context(ctx)
+    print(
+        f"[MarketContext] Premarket updated: US={us_signal}, "
+        f"Asia={asia_signal}, prediction={prediction}"
+    )
 
 
 def format_context_summary() -> str:

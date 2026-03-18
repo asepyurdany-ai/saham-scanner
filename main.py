@@ -25,6 +25,8 @@ from agents.scanner import (
 )
 from agents.sentinel import run_sentinel
 from agents.radar import run_radar, run_macro_shock_check
+from agents.market_breadth import run_breadth_check
+from agents.premarket import run_premarket_briefing
 from agents.position_tracker import (
     run_position_monitor, send_position_update, load_positions,
     add_position, add_position_idr, close_position, parse_buy_command,
@@ -234,6 +236,22 @@ def safe_run_position_update():
         print(f"[Main] Position update error: {e}")
 
 
+def safe_run_breadth_check():
+    """Run market breadth check every 30 min during market hours."""
+    if not is_market_day():
+        return
+    if not is_market_hours_utc():
+        return
+    safe_run(run_breadth_check, "Market Breadth Check")
+
+
+def safe_run_premarket():
+    """Run pre-market briefing at 07:00 WIB (00:00 UTC) on weekdays."""
+    if not is_market_day():
+        return
+    safe_run(run_premarket_briefing, "Pre-market Briefing")
+
+
 def run_friday_journal():
     """Send journal summary on Fridays EOD."""
     if now_wib().weekday() != 4:  # 4 = Friday
@@ -309,6 +327,19 @@ POSITION_UPDATE_SLOTS = [
 ]
 for slot in POSITION_UPDATE_SLOTS:
     schedule.every().day.at(slot).do(safe_run_position_update)
+
+# ─── Market breadth check every 30 min during market hours ─────────────────
+# (same slots as position update — piggyback on market hours window)
+BREADTH_CHECK_SLOTS = [
+    "01:55", "02:25", "02:55", "03:25", "03:55",
+    "04:25", "04:55", "05:25", "05:55",
+    "06:25", "06:55", "07:25", "07:55",
+]
+for slot in BREADTH_CHECK_SLOTS:
+    schedule.every().day.at(slot).do(safe_run_breadth_check)
+
+# ─── Pre-market briefing at 07:00 WIB = 00:00 UTC (weekdays only) ──────────
+schedule.every().day.at("00:00").do(safe_run_premarket)
 
 
 def _send_telegram(msg: str):
@@ -483,11 +514,13 @@ def check_telegram_commands():
 def run_daemon():
     print(f"[Saham Scanner] Daemon started at {now_wib().strftime('%Y-%m-%d %H:%M')} WIB")
     print("[Saham Scanner] Schedule:")
+    print("  07:00 WIB - Pre-market briefing (Wall Street + Asia + Macro + AI analysis)")
     print("  08:45 WIB - Morning Sequence: Radar → Sentinel → Scanner (full context)")
     print("  08:45 WIB - Shared Intelligence: agents saling connected via market context")
     print("  08:55-15:00 WIB - Macro shock check every 5 min")
     print("  08:55-15:00 WIB - Real-time every 10 min (Scanner + PositionTracker + SellScan)")
     print("  08:55-15:00 WIB - Position P&L update every 30 min")
+    print("  08:55-15:00 WIB - Market breadth gate check every 30 min")
     print("  09:00+ WIB - Sentinel & Radar checks")
     print("  15:35 WIB - Closing delta report (EOD format)")
     print("  15:40 WIB (Fri) - Weekly accuracy + improvement report + journal")
@@ -537,7 +570,11 @@ if __name__ == "__main__":
         elif cmd == "positions_update":
             positions = load_positions(DEFAULT_POSITIONS_FILE)
             send_position_update(positions)
+        elif cmd == "premarket":
+            run_premarket_briefing()
+        elif cmd == "breadth":
+            run_breadth_check()
         else:
-            print("Usage: python main.py [scan|close|sentinel|radar|realtime|sell|macro|positions|positions_update|weekly|improve|journal|daemon]")
+            print("Usage: python main.py [scan|close|sentinel|radar|realtime|sell|macro|positions|positions_update|weekly|improve|journal|premarket|breadth|daemon]")
     else:
         run_daemon()
