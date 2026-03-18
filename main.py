@@ -48,24 +48,25 @@ def now_wib():
     return datetime.utcnow() + timedelta(hours=7)
 
 
+# IDX Public Holidays 2026 — semua monitoring skip di hari ini
 IDX_HOLIDAYS_2026 = {
-    "2026-01-01",  # Tahun Baru
-    "2026-01-27",  # Isra Mi'raj
-    "2026-01-29",  # Tahun Baru Imlek
-    "2026-03-19",  # Nyepi
-    "2026-03-20",  # Wafat Isa Almasih (Good Friday)
-    "2026-04-01",  # Hari Raya Idul Fitri
-    "2026-04-02",  # Hari Raya Idul Fitri
-    "2026-04-03",  # Cuti Bersama
-    "2026-05-01",  # Hari Buruh
-    "2026-05-14",  # Kenaikan Isa Almasih
-    "2026-05-23",  # Hari Raya Waisak
-    "2026-06-01",  # Hari Lahir Pancasila
-    "2026-06-06",  # Idul Adha
-    "2026-06-26",  # Tahun Baru Islam
-    "2026-08-17",  # HUT RI
-    "2026-09-04",  # Maulid Nabi
-    "2026-12-25",  # Natal
+    "2026-01-01": "Tahun Baru Masehi",
+    "2026-01-27": "Isra Mi'raj Nabi Muhammad SAW",
+    "2026-01-29": "Tahun Baru Imlek",
+    "2026-03-19": "Hari Raya Nyepi",
+    "2026-03-20": "Wafat Isa Almasih",
+    "2026-04-01": "Hari Raya Idul Fitri",
+    "2026-04-02": "Hari Raya Idul Fitri",
+    "2026-04-03": "Cuti Bersama Idul Fitri",
+    "2026-05-01": "Hari Buruh Internasional",
+    "2026-05-14": "Kenaikan Isa Almasih",
+    "2026-05-23": "Hari Raya Waisak",
+    "2026-06-01": "Hari Lahir Pancasila",
+    "2026-06-06": "Hari Raya Idul Adha",
+    "2026-06-26": "Tahun Baru Islam",
+    "2026-08-17": "HUT Kemerdekaan RI",
+    "2026-09-04": "Maulid Nabi Muhammad SAW",
+    "2026-12-25": "Hari Raya Natal",
 }
 
 
@@ -79,6 +80,40 @@ def is_market_day() -> bool:
         print(f"[Scheduler] IDX holiday today ({date_str}) — skipping market tasks")
         return False
     return True
+
+
+def send_holiday_notification():
+    """Send Telegram notification if today is an IDX holiday. Called at 07:00 WIB."""
+    wib = now_wib()
+    if wib.weekday() >= 5:
+        return  # weekend, no notification needed
+    date_str = wib.strftime("%Y-%m-%d")
+    holiday_name = IDX_HOLIDAYS_2026.get(date_str)
+    if not holiday_name:
+        return  # bukan hari libur
+
+    msg = (
+        f"🎌 <b>HARI LIBUR NASIONAL</b>\n\n"
+        f"📅 {wib.strftime('%d %b %Y')} — <b>{holiday_name}</b>\n\n"
+        f"🏦 IDX tutup hari ini.\n"
+        f"⏸ Semua monitoring saham di-skip.\n\n"
+        f"🌏 Pre-market briefing global tetap dikirim.\n"
+        f"📈 Trading normal kembali hari kerja berikutnya."
+    )
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        resp = requests.post(url, json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": msg,
+            "parse_mode": "HTML"
+        }, timeout=10)
+        data = resp.json()
+        if data.get("ok"):
+            print(f"[Scheduler] Holiday notification sent: {holiday_name}")
+        else:
+            print(f"[Scheduler] Holiday notification failed: {data}")
+    except Exception as e:
+        print(f"[Scheduler] Holiday notification error: {e}")
 
 
 def is_market_hours_utc() -> bool:
@@ -276,6 +311,7 @@ def safe_run_premarket():
     """Run pre-market briefing at 07:00 WIB on weekdays — including holidays (global markets still open)."""
     if now_wib().weekday() >= 5:  # skip weekend only
         return
+    send_holiday_notification()  # kirim notif libur jika hari ini libur (sebelum briefing)
     safe_run(run_premarket_briefing, "Pre-market Briefing")
 
 
