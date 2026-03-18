@@ -350,3 +350,263 @@ class TestAnalyzeGeoImpact:
             articles = [{"source": "Reuters", "title": "test", "summary": "test", "id": "1"}]
             result = analyze_geo_impact(articles)
             assert result == []
+
+
+# ─── Tests: check_macro_shock ───────────────────────────────────────────────
+
+class TestCheckMacroShock:
+
+    def test_returns_list(self):
+        """check_macro_shock should return a list."""
+        from agents.radar import check_macro_shock
+        from unittest.mock import patch
+        import pandas as pd
+
+        # Mock yf.Ticker to return empty history (no shock)
+        with patch("agents.radar.yf.Ticker") as mock_ticker_cls:
+            mock_ticker = mock_ticker_cls.return_value
+            mock_ticker.history.return_value = pd.DataFrame()
+            result = check_macro_shock()
+
+        assert isinstance(result, list)
+
+    def test_no_shock_below_threshold(self):
+        """No shock alert when USD/IDR moves < 1.5%."""
+        from agents.radar import check_macro_shock
+        from unittest.mock import patch, MagicMock
+        import pandas as pd
+
+        # 0.5% move — below both thresholds
+        def make_mock_hist(open_p, close_p):
+            df = pd.DataFrame({
+                "Open": [open_p, open_p],
+                "Close": [open_p, close_p],
+            })
+            return df
+
+        with patch("agents.radar.yf.Ticker") as mock_ticker_cls:
+            mock_ticker = MagicMock()
+            mock_ticker_cls.return_value = mock_ticker
+
+            # USD/IDR: 0.5% move (below 1.5% threshold)
+            hist_usd = make_mock_hist(16000.0, 16080.0)  # +0.5%
+            # WTI Oil: 1% move (below 3% threshold)
+            hist_oil = make_mock_hist(80.0, 80.8)  # +1%
+
+            call_count = [0]
+            def side_effect(period, interval=None):
+                call_count[0] += 1
+                if call_count[0] <= 1:
+                    return hist_usd
+                return hist_oil
+
+            mock_ticker.history.side_effect = side_effect
+            result = check_macro_shock()
+
+        assert len(result) == 0
+
+    def test_shock_detected_usd_idr(self):
+        """Should detect USD/IDR shock when move > 1.5%."""
+        from agents.radar import check_macro_shock
+        from unittest.mock import patch, MagicMock
+        import pandas as pd
+
+        def make_hist(open_p, close_p):
+            return pd.DataFrame({
+                "Open": [open_p] * 5,
+                "Close": [open_p] * 4 + [close_p],
+            })
+
+        with patch("agents.radar.yf.Ticker") as mock_ticker_cls:
+            mock_ticker = MagicMock()
+            mock_ticker_cls.return_value = mock_ticker
+
+            # USD/IDR: +2.1% move (above 1.5% threshold)
+            call_count = [0]
+            def side_effect(period, interval=None):
+                call_count[0] += 1
+                if call_count[0] <= 1:
+                    return make_hist(16000.0, 16336.0)  # +2.1%
+                return make_hist(80.0, 80.8)  # oil: +1% (no shock)
+
+            mock_ticker.history.side_effect = side_effect
+            result = check_macro_shock()
+
+        shock_names = [s["name"] for s in result]
+        assert "USD/IDR" in shock_names
+
+    def test_shock_structure(self):
+        """Shock dict should have required keys."""
+        from agents.radar import check_macro_shock
+        from unittest.mock import patch, MagicMock
+        import pandas as pd
+
+        def make_hist(open_p, close_p):
+            return pd.DataFrame({
+                "Open": [open_p] * 5,
+                "Close": [open_p] * 4 + [close_p],
+            })
+
+        with patch("agents.radar.yf.Ticker") as mock_ticker_cls:
+            mock_ticker = MagicMock()
+            mock_ticker_cls.return_value = mock_ticker
+
+            call_count = [0]
+            def side_effect(period, interval=None):
+                call_count[0] += 1
+                if call_count[0] <= 1:
+                    return make_hist(16000.0, 16336.0)  # USD/IDR +2.1%
+                return make_hist(80.0, 78.0)  # WTI Oil -2.5% (below 3%)
+
+            mock_ticker.history.side_effect = side_effect
+            result = check_macro_shock()
+
+        if result:
+            shock = result[0]
+            for key in ["name", "current", "open", "change_pct", "threshold", "scan_time"]:
+                assert key in shock, f"Missing key: {key}"
+
+    def test_wti_shock_detected(self):
+        """Should detect WTI Oil shock when move > 3%."""
+        from agents.radar import check_macro_shock
+        from unittest.mock import patch, MagicMock
+        import pandas as pd
+
+        def make_hist(open_p, close_p):
+            return pd.DataFrame({
+                "Open": [open_p] * 5,
+                "Close": [open_p] * 4 + [close_p],
+            })
+
+        with patch("agents.radar.yf.Ticker") as mock_ticker_cls:
+            mock_ticker = MagicMock()
+            mock_ticker_cls.return_value = mock_ticker
+
+            call_count = [0]
+            def side_effect(period, interval=None):
+                call_count[0] += 1
+                if call_count[0] <= 1:
+                    return make_hist(16000.0, 16080.0)  # USD/IDR +0.5% (no shock)
+                return make_hist(80.0, 83.2)  # WTI Oil +4% (above 3% threshold)
+
+            mock_ticker.history.side_effect = side_effect
+            result = check_macro_shock()
+
+        shock_names = [s["name"] for s in result]
+        assert "WTI Oil" in shock_names
+
+    def test_handles_empty_history(self):
+        """Should not crash on empty history from yfinance."""
+        from agents.radar import check_macro_shock
+        from unittest.mock import patch
+        import pandas as pd
+
+        with patch("agents.radar.yf.Ticker") as mock_ticker_cls:
+            mock_ticker = mock_ticker_cls.return_value
+            mock_ticker.history.return_value = pd.DataFrame()
+            result = check_macro_shock()
+
+        assert isinstance(result, list)
+
+    def test_change_pct_positive_for_rise(self):
+        """change_pct should be positive for price increase."""
+        from agents.radar import check_macro_shock
+        from unittest.mock import patch, MagicMock
+        import pandas as pd
+
+        def make_hist(open_p, close_p):
+            return pd.DataFrame({
+                "Open": [open_p] * 5,
+                "Close": [open_p] * 4 + [close_p],
+            })
+
+        with patch("agents.radar.yf.Ticker") as mock_ticker_cls:
+            mock_ticker = MagicMock()
+            mock_ticker_cls.return_value = mock_ticker
+
+            call_count = [0]
+            def side_effect(period, interval=None):
+                call_count[0] += 1
+                if call_count[0] <= 1:
+                    return make_hist(16000.0, 16336.0)  # +2.1%
+                return pd.DataFrame()
+
+            mock_ticker.history.side_effect = side_effect
+            result = check_macro_shock()
+
+        if result:
+            assert result[0]["change_pct"] > 0
+
+
+# ─── Tests: format_macro_shock_alert ────────────────────────────────────────
+
+class TestFormatMacroShockAlert:
+
+    def _make_shock(self, name="USD/IDR", current=16450.0, change_pct=2.1):
+        return {
+            "name": name,
+            "current": current,
+            "open": current / (1 + change_pct / 100),
+            "change_pct": change_pct,
+            "threshold": 1.5,
+            "scan_time": "11:32",
+        }
+
+    def test_returns_none_for_empty(self):
+        """format_macro_shock_alert should return None for empty list."""
+        from agents.radar import format_macro_shock_alert
+        assert format_macro_shock_alert([]) is None
+
+    def test_returns_string(self):
+        """format_macro_shock_alert should return a string."""
+        from agents.radar import format_macro_shock_alert
+        result = format_macro_shock_alert([self._make_shock()])
+        assert isinstance(result, str)
+
+    def test_contains_macro_shock_header(self):
+        """Message should contain MACRO SHOCK header."""
+        from agents.radar import format_macro_shock_alert
+        msg = format_macro_shock_alert([self._make_shock()])
+        assert "MACRO SHOCK" in msg
+
+    def test_contains_usd_idr_info(self):
+        """Message should include USD/IDR data."""
+        from agents.radar import format_macro_shock_alert
+        msg = format_macro_shock_alert([self._make_shock("USD/IDR", 16450.0, 2.1)])
+        assert "USD/IDR" in msg
+        assert "2.1" in msg
+
+    def test_contains_priority_stocks(self):
+        """Message should list priority exit stocks."""
+        from agents.radar import format_macro_shock_alert
+        msg = format_macro_shock_alert([self._make_shock()])
+        assert "GOTO" in msg or "BUKA" in msg or "BMRI" in msg
+
+    def test_wib_timestamp_present(self):
+        """Message should contain WIB timestamp."""
+        from agents.radar import format_macro_shock_alert
+        msg = format_macro_shock_alert([self._make_shock()])
+        assert "WIB" in msg
+
+    def test_rupiah_weakening_message(self):
+        """Positive USD/IDR change should mention rupiah weakening."""
+        from agents.radar import format_macro_shock_alert
+        msg = format_macro_shock_alert([self._make_shock("USD/IDR", 16450.0, 2.1)])
+        assert "melemah" in msg.lower() or "outflow" in msg.lower()
+
+    def test_oil_shock_message(self):
+        """WTI Oil shock should mention oil."""
+        from agents.radar import format_macro_shock_alert
+        msg = format_macro_shock_alert([self._make_shock("WTI Oil", 85.0, 4.0)])
+        assert "WTI Oil" in msg or "Minyak" in msg
+
+    def test_multiple_shocks(self):
+        """Should handle multiple simultaneous shocks."""
+        from agents.radar import format_macro_shock_alert
+        shocks = [
+            self._make_shock("USD/IDR", 16450.0, 2.1),
+            self._make_shock("WTI Oil", 85.0, 4.5),
+        ]
+        msg = format_macro_shock_alert(shocks)
+        assert "USD/IDR" in msg
+        assert "WTI Oil" in msg

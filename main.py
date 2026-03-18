@@ -2,24 +2,29 @@
 Saham Scanner — Main Daemon
 Schedule (WIB):
   08:45 - Morning scan (Scanner) with macro + sector context
-  08:55-15:00 - Real-time monitoring every 10 min (Scanner + PositionTracker)
+  08:55-15:00 - Real-time monitoring every 10 min (Scanner + PositionTracker + SellScan)
+  08:55-15:00 - Macro shock check every 5 min (Radar)
   09:00 - Market open commodity check (Radar)
   09:30, 10:30, 11:30, 13:00, 14:00 - Sentinel + Radar check
-  15:35 - Closing delta report (Scanner)
-  Weekend/holiday: skip
+  15:35 - Closing delta report (Scanner) — new EOD format
+  15:40 (Fridays) - Self-improvement weekly report
 
 Self-healing: failed agents are auto-restarted on next run.
+Error logging via SelfImprover.log_error on all agent failures.
 """
 
 import time
 import schedule
 import threading
 from datetime import datetime, timedelta
-from agents.scanner import run_morning_scan, run_closing_report, run_realtime_scan
+from agents.scanner import (
+    run_morning_scan, run_closing_report, run_realtime_scan, run_sell_scan
+)
 from agents.sentinel import run_sentinel
-from agents.radar import run_radar
+from agents.radar import run_radar, run_macro_shock_check
 from agents.position_tracker import run_position_monitor
 from agents.signal_tracker import log_signals_open, log_signals_close, send_weekly_accuracy_report
+from agents.self_improver import generate_improvement_report, log_error
 
 
 def now_wib():
@@ -66,12 +71,16 @@ def safe_run(fn, name: str):
         _agent_failures[name] = 0  # Reset on success
     except Exception as e:
         _agent_failures[name] = _agent_failures.get(name, 0) + 1
-        print(f"[Main] ERROR in {name} (fail #{_agent_failures[name]}): {e}")
-        # Self-healing: log and continue, will retry next scheduled run
+        error_msg = str(e)
+        print(f"[Main] ERROR in {name} (fail #{_agent_failures[name]}): {error_msg}")
+        try:
+            log_error(name, error_msg, context=f"safe_run at {now_wib().strftime('%H:%M')} WIB")
+        except Exception:
+            pass
 
 
 def safe_run_realtime():
-    """Real-time monitoring job — only runs during market hours."""
+    """Real-time monitoring job (every 10 min) — only runs during market hours."""
     if not is_market_day():
         return
     if not is_market_hours_utc():
@@ -80,25 +89,45 @@ def safe_run_realtime():
 
     safe_run(run_realtime_scan, "Real-time Scan")
     safe_run(run_position_monitor, "Position Monitor")
+    safe_run(run_sell_scan, "Sell Signal Scan")
+
+
+def safe_run_macro_shock():
+    """Macro shock check (every 5 min) — only during market hours."""
+    if not is_market_day():
+        return
+    if not is_market_hours_utc():
+        return
+
+    safe_run(run_macro_shock_check, "Macro Shock Check")
 
 
 # --- Scheduled Jobs ---
 
 def run_morning_scan_with_tracker():
     """Morning scan + log signals for accuracy tracking."""
-    signals = run_morning_scan()
+    try:
+        signals = run_morning_scan()
+    except Exception as e:
+        log_error("Morning Scan", str(e), "run_morning_scan_with_tracker")
+        signals = []
     try:
         log_signals_open(signals)
     except Exception as e:
+        log_error("SignalTracker", str(e), "log_signals_open")
         print(f"[Main] SignalTracker open log error: {e}")
 
 
 def run_closing_report_with_tracker():
     """Closing delta + evaluate signal accuracy."""
-    run_closing_report()
+    try:
+        run_closing_report()
+    except Exception as e:
+        log_error("Closing Report", str(e), "run_closing_report")
     try:
         log_signals_close()
     except Exception as e:
+        log_error("SignalTracker", str(e), "log_signals_close")
         print(f"[Main] SignalTracker close log error: {e}")
 
 
@@ -109,16 +138,45 @@ def run_weekly_accuracy_report():
     try:
         send_weekly_accuracy_report()
     except Exception as e:
+        log_error("WeeklyAccuracy", str(e), "send_weekly_accuracy_report")
         print(f"[Main] Weekly accuracy report error: {e}")
 
 
-# Morning scan (UTC 01:45 = WIB 08:45)
+def run_weekly_improvement_report():
+    """Self-improvement report — only runs on Fridays."""
+    if now_wib().weekday() != 4:  # 4 = Friday
+        return
+    try:
+        generate_improvement_report()
+    except Exception as e:
+        log_error("SelfImprover", str(e), "generate_improvement_report")
+        print(f"[Main] Improvement report error: {e}")
+
+
+# ─── Macro Shock: every 5 min during market hours ──────────────────────────
+# 01:55–08:00 UTC = 08:55–15:00 WIB, every 5 minutes
+MACRO_SHOCK_SLOTS = [
+    "01:55", "02:00", "02:05", "02:10", "02:15", "02:20", "02:25", "02:30",
+    "02:35", "02:40", "02:45", "02:50", "02:55", "03:00", "03:05", "03:10",
+    "03:15", "03:20", "03:25", "03:30", "03:35", "03:40", "03:45", "03:50",
+    "03:55", "04:00", "04:05", "04:10", "04:15", "04:20", "04:25", "04:30",
+    "04:35", "04:40", "04:45", "04:50", "04:55", "05:00", "05:05", "05:10",
+    "05:15", "05:20", "05:25", "05:30", "05:35", "05:40", "05:45", "05:50",
+    "05:55", "06:00", "06:05", "06:10", "06:15", "06:20", "06:25", "06:30",
+    "06:35", "06:40", "06:45", "06:50", "06:55", "07:00", "07:05", "07:10",
+    "07:15", "07:20", "07:25", "07:30", "07:35", "07:40", "07:45", "07:50",
+    "07:55", "08:00",
+]
+for slot in MACRO_SHOCK_SLOTS:
+    schedule.every().day.at(slot).do(safe_run_macro_shock)
+
+# ─── Morning scan (UTC 01:45 = WIB 08:45) ──────────────────────────────────
 schedule.every().day.at("01:45").do(safe_run, run_morning_scan_with_tracker, "Morning Scan + Tracker")
 
-# Market open commodity check (UTC 02:00 = WIB 09:00)
+# ─── Market open commodity check (UTC 02:00 = WIB 09:00) ───────────────────
 schedule.every().day.at("02:00").do(safe_run, run_radar, "Radar (Market Open)")
 
-# Real-time monitoring every 10 min during market hours (01:55-08:00 UTC = 08:55-15:00 WIB)
+# ─── Real-time + Sell scan: every 10 min during market hours ───────────────
 REALTIME_SLOTS = [
     "01:55", "02:05", "02:15", "02:25", "02:35", "02:45", "02:55",
     "03:05", "03:15", "03:25", "03:35", "03:45", "03:55",
@@ -130,7 +188,7 @@ REALTIME_SLOTS = [
 for slot in REALTIME_SLOTS:
     schedule.every().day.at(slot).do(safe_run_realtime)
 
-# Sentinel checks (UTC = WIB-7)
+# ─── Sentinel + Radar checks ───────────────────────────────────────────────
 schedule.every().day.at("02:30").do(safe_run, run_sentinel, "Sentinel")
 schedule.every().day.at("03:30").do(safe_run, run_sentinel, "Sentinel")
 schedule.every().day.at("03:30").do(safe_run, run_radar, "Radar")
@@ -140,21 +198,25 @@ schedule.every().day.at("06:00").do(safe_run, run_radar, "Radar")
 schedule.every().day.at("07:00").do(safe_run, run_sentinel, "Sentinel")
 schedule.every().day.at("07:00").do(safe_run, run_radar, "Radar")
 
-# Closing delta report + signal accuracy (UTC 08:35 = WIB 15:35)
+# ─── EOD: Closing delta report + signal accuracy (UTC 08:35 = WIB 15:35) ───
 schedule.every().day.at("08:35").do(safe_run, run_closing_report_with_tracker, "Closing Delta Report + Tracker")
 
-# Friday weekly accuracy report (UTC 08:40 = WIB 15:40)
+# ─── Friday: Weekly accuracy + improvement report (UTC 08:40 = WIB 15:40) ──
 schedule.every().day.at("08:40").do(safe_run, run_weekly_accuracy_report, "Weekly Accuracy Report")
+schedule.every().day.at("08:40").do(safe_run, run_weekly_improvement_report, "Weekly Improvement Report")
 
 
 def run_daemon():
     print(f"[Saham Scanner] Daemon started at {now_wib().strftime('%Y-%m-%d %H:%M')} WIB")
     print("[Saham Scanner] Schedule:")
     print("  08:45 WIB - Morning Scan (macro + sector context)")
-    print("  08:55-15:00 WIB - Real-time every 10 min (Scanner + PositionTracker)")
+    print("  08:55-15:00 WIB - Macro shock check every 5 min")
+    print("  08:55-15:00 WIB - Real-time every 10 min (Scanner + PositionTracker + SellScan)")
     print("  09:00+ WIB - Sentinel & Radar checks")
-    print("  15:35 WIB - Closing delta report")
+    print("  15:35 WIB - Closing delta report (EOD format)")
+    print("  15:40 WIB (Fri) - Weekly accuracy + improvement report")
     print("[Saham Scanner] Self-healing: agents auto-restart on failure")
+    print("[Saham Scanner] Error logging: via SelfImprover.log_error")
 
     while True:
         try:
@@ -178,13 +240,19 @@ if __name__ == "__main__":
             run_radar()
         elif cmd == "realtime":
             run_realtime_scan()
+        elif cmd == "sell":
+            run_sell_scan()
+        elif cmd == "macro":
+            run_macro_shock_check()
         elif cmd == "positions":
             run_position_monitor()
         elif cmd == "weekly":
             send_weekly_accuracy_report()
+        elif cmd == "improve":
+            generate_improvement_report()
         elif cmd == "daemon":
             run_daemon()
         else:
-            print("Usage: python main.py [scan|close|sentinel|radar|realtime|positions|weekly|daemon]")
+            print("Usage: python main.py [scan|close|sentinel|radar|realtime|sell|macro|positions|weekly|improve|daemon]")
     else:
         run_daemon()

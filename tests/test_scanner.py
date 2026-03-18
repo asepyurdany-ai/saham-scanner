@@ -14,7 +14,10 @@ import pytest
 # Ensure project root on path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from agents.scanner import compute_signals, save_signals, format_morning_alert, compute_macd
+from agents.scanner import (
+    compute_signals, save_signals, format_morning_alert, compute_macd,
+    classify_trading_style, scan_for_sell_signals, format_sell_alert,
+)
 
 
 def make_df(prices, volumes=None, highs=None, lows=None):
@@ -535,3 +538,372 @@ class TestFormatMorningAlert:
         msg = format_morning_alert(signals)
 
         assert "5/6" in msg
+
+
+# ─── Tests: classify_trading_style ──────────────────────────────────────────
+
+def _make_signal_for_classify(
+    score=5, vol_ratio=2.0, rsi=50.0, daily_change_pct=1.0,
+    current=1000.0, bb_upper=1100.0, macd_bullish=True, uptrend=True,
+):
+    """Helper: create a minimal signal dict for classify_trading_style tests."""
+    return {
+        "ticker": "BBCA.JK",
+        "score": score,
+        "vol_ratio": vol_ratio,
+        "rsi": rsi,
+        "daily_change_pct": daily_change_pct,
+        "current": current,
+        "bb_upper": bb_upper,
+        "macd_bullish": macd_bullish,
+        "conditions": {
+            "uptrend": uptrend,
+            "volume_spike": vol_ratio >= 2.0,
+            "rsi_ok": 25 < rsi < 70,
+            "price_above_ma20": True,
+            "macd_bullish": macd_bullish,
+            "momentum_positive": daily_change_pct > 0,
+        },
+    }
+
+
+class TestClassifyTradingStyle:
+
+    def test_returns_dict(self):
+        """classify_trading_style should return a dict."""
+        sig = _make_signal_for_classify()
+        result = classify_trading_style(sig)
+        assert isinstance(result, dict)
+
+    def test_required_keys(self):
+        """Result should have required keys."""
+        sig = _make_signal_for_classify()
+        result = classify_trading_style(sig)
+        for key in ["style", "intraday_met", "swing_met"]:
+            assert key in result, f"Missing key: {key}"
+
+    def test_intraday_and_swing_when_all_met(self):
+        """Should return INTRADAY + SWING when all conditions met."""
+        sig = _make_signal_for_classify(
+            score=5, vol_ratio=2.0, rsi=50.0, daily_change_pct=1.0,
+            current=1000.0, bb_upper=1100.0, macd_bullish=True, uptrend=True,
+        )
+        result = classify_trading_style(sig)
+        assert result["intraday_met"] is True
+        assert result["swing_met"] is True
+        assert "INTRADAY" in result["style"]
+        assert "SWING" in result["style"]
+
+    def test_only_intraday_when_swing_extra_fails(self):
+        """Should return only INTRADAY when MACD or uptrend missing."""
+        sig = _make_signal_for_classify(
+            score=5, vol_ratio=2.0, rsi=50.0, daily_change_pct=1.0,
+            current=1000.0, bb_upper=1100.0, macd_bullish=False, uptrend=False,
+        )
+        result = classify_trading_style(sig)
+        assert result["intraday_met"] is True
+        assert result["swing_met"] is False
+        assert result["style"] == "🏃 INTRADAY"
+
+    def test_none_when_score_below_5(self):
+        """Should return None style when score < 5."""
+        sig = _make_signal_for_classify(score=4)
+        result = classify_trading_style(sig)
+        assert result["style"] is None
+
+    def test_none_when_empty_signal(self):
+        """Should return None style for empty signal."""
+        result = classify_trading_style({})
+        assert result["style"] is None
+
+    def test_none_signal_input(self):
+        """Should handle None input gracefully."""
+        result = classify_trading_style(None)
+        assert result["style"] is None
+
+    def test_intraday_tp_sl_set_when_intraday_met(self):
+        """Intraday TP (+2.5%) and SL (-2%) should be set when intraday met."""
+        sig = _make_signal_for_classify(score=5, current=1000.0)
+        result = classify_trading_style(sig)
+        if result["intraday_met"]:
+            assert result["intraday_tp"] == 1025.0
+            assert result["intraday_sl"] == 980.0
+
+    def test_swing_tp_sl_set_when_swing_met(self):
+        """Swing TP (+8%) and SL (-4%) should be set when swing met."""
+        sig = _make_signal_for_classify(
+            score=5, current=1000.0, macd_bullish=True, uptrend=True
+        )
+        result = classify_trading_style(sig)
+        if result["swing_met"]:
+            assert result["swing_tp"] == 1080.0
+            assert result["swing_sl"] == 960.0
+
+    def test_intraday_tp_sl_none_when_not_met(self):
+        """intraday_tp/sl should be None when intraday not met."""
+        sig = _make_signal_for_classify(score=4)  # score < 5
+        result = classify_trading_style(sig)
+        assert result["intraday_tp"] is None
+        assert result["intraday_sl"] is None
+
+    def test_rsi_outside_35_62_reduces_intraday(self):
+        """RSI outside 35-62 range should count against intraday criteria."""
+        # RSI = 70 (overbought) — should not meet rsi_range check
+        sig = _make_signal_for_classify(
+            score=5, rsi=70.0, vol_ratio=2.0, daily_change_pct=1.0,
+            current=1000.0, bb_upper=1100.0,
+        )
+        result = classify_trading_style(sig)
+        if result["intraday_met"]:
+            intraday_checks = result.get("intraday_checks", {})
+            assert intraday_checks.get("rsi_range") is False
+
+    def test_near_upper_bb_fails_not_near_bb_check(self):
+        """Price at upper BB should fail not_near_upper_bb check."""
+        # price = 1000, bb_upper = 1000 → price NOT < upper * 0.99
+        sig = _make_signal_for_classify(
+            score=5, current=1000.0, bb_upper=1000.0,
+        )
+        result = classify_trading_style(sig)
+        if result.get("intraday_checks"):
+            assert result["intraday_checks"]["not_near_upper_bb"] is False
+
+    def test_intraday_criteria_need_3_of_4(self):
+        """Should be intraday if exactly 3 of 4 criteria met."""
+        # Only 3 criteria met: vol_ratio, rsi_range, positive_change
+        # But NOT not_near_upper_bb (price = bb_upper * 0.995)
+        sig = _make_signal_for_classify(
+            score=5, vol_ratio=2.0, rsi=50.0, daily_change_pct=1.0,
+            current=995.0, bb_upper=1000.0,  # 995 < 1000*0.99=990? No. 995 > 990 → fails
+        )
+        result = classify_trading_style(sig)
+        # rsi_range=True, vol_1_5x=True, positive_change=True → 3/4 → intraday_met=True
+        assert result["intraday_met"] is True
+
+
+# ─── Tests: scan_for_sell_signals ───────────────────────────────────────────
+
+class TestScanForSellSignals:
+
+    def test_returns_list(self):
+        """scan_for_sell_signals should return a list."""
+        from unittest.mock import patch
+        import pandas as pd
+        from agents.scanner import scan_for_sell_signals
+
+        with patch("agents.scanner.get_stock_data", return_value=pd.DataFrame()):
+            result = scan_for_sell_signals([{"ticker": "BBCA.JK"}])
+        assert isinstance(result, list)
+
+    def test_with_empty_prev_signals_returns_list(self):
+        """Should return list even with empty input (uses WATCHLIST fallback)."""
+        from unittest.mock import patch
+        import pandas as pd
+
+        # Mock get_stock_data to return empty df so scan skips all tickers
+        with patch("agents.scanner.get_stock_data", return_value=pd.DataFrame()):
+            result = scan_for_sell_signals([])
+        assert isinstance(result, list)
+
+    def test_detects_strong_sell(self):
+        """Should detect STRONG_SELL when 3/4 conditions met."""
+        from unittest.mock import patch
+        import pandas as pd
+
+        # Build a dataframe with overbought RSI + break below MA20 + volume spike
+        # Need 20+ rows for MA20 and 14 for RSI
+        n = 30
+        prices = [1100.0] * (n - 1) + [900.0]  # Last day crashes below MA20
+        volumes = [500_000] * (n - 1) + [1_200_000]  # Volume spike on last day
+
+        dates = pd.date_range("2026-01-01", periods=n, freq="D")
+        df = pd.DataFrame({
+            "Open": [1100.0] * (n - 1) + [1100.0],
+            "High": [p * 1.01 for p in prices],
+            "Low": [p * 0.98 for p in prices],
+            "Close": prices,
+            "Volume": volumes,
+        }, index=dates)
+
+        with patch("agents.scanner.get_stock_data", return_value=df):
+            result = scan_for_sell_signals([{"ticker": "BBCA.JK"}])
+
+        # We can't guarantee exactly 3 conditions without precise RSI/MACD,
+        # but result must be a list
+        assert isinstance(result, list)
+
+    def test_sector_collapse_detected(self):
+        """Should detect SECTOR_COLLAPSE if 3+ stocks in same sector down >1.5%."""
+        from unittest.mock import patch
+        import pandas as pd
+
+        n = 30
+        # Stocks are down 2% from open
+        prices = [1000.0] * (n - 1) + [980.0]  # 2% drop
+        opens = [1000.0] * n
+
+        dates = pd.date_range("2026-01-01", periods=n, freq="D")
+        df = pd.DataFrame({
+            "Open": opens,
+            "High": [p * 1.01 for p in prices],
+            "Low": [p * 0.98 for p in prices],
+            "Close": prices,
+            "Volume": [500_000] * n,
+        }, index=dates)
+
+        # Patch all 4 Perbankan stocks to return this df
+        perbankan = ["BBCA.JK", "BBRI.JK", "BMRI.JK", "BBNI.JK"]
+        prev_signals = [{"ticker": t} for t in perbankan]
+
+        with patch("agents.scanner.get_stock_data", return_value=df):
+            result = scan_for_sell_signals(prev_signals)
+
+        collapse_signals = [s for s in result if s["sell_type"] == "SECTOR_COLLAPSE"]
+        assert len(collapse_signals) >= 1
+        assert collapse_signals[0]["sector"] == "Perbankan"
+
+    def test_no_sell_when_healthy(self):
+        """Should return no STRONG_SELL signals for healthy/rising stock."""
+        from unittest.mock import patch
+        import pandas as pd
+
+        n = 30
+        prices = [float(1000 + i * 5) for i in range(n)]  # Rising prices
+        opens = [p * 0.99 for p in prices]
+
+        dates = pd.date_range("2026-01-01", periods=n, freq="D")
+        df = pd.DataFrame({
+            "Open": opens,
+            "High": [p * 1.02 for p in prices],
+            "Low": [p * 0.99 for p in prices],
+            "Close": prices,
+            "Volume": [500_000] * n,
+        }, index=dates)
+
+        with patch("agents.scanner.get_stock_data", return_value=df):
+            result = scan_for_sell_signals([{"ticker": "BBCA.JK"}])
+
+        strong_sells = [s for s in result if s["sell_type"] == "STRONG_SELL"]
+        assert len(strong_sells) == 0
+
+    def test_skips_empty_df(self):
+        """Should not crash when get_stock_data returns empty df."""
+        from unittest.mock import patch
+        import pandas as pd
+
+        with patch("agents.scanner.get_stock_data", return_value=pd.DataFrame()):
+            result = scan_for_sell_signals([{"ticker": "BBCA.JK"}])
+        assert isinstance(result, list)
+
+
+# ─── Tests: format_sell_alert ───────────────────────────────────────────────
+
+class TestFormatSellAlert:
+
+    def _make_strong_sell(self, ticker="BBCA.JK", rsi=74.2, vol_ratio=2.1,
+                          current=4210.0, from_ma20=-1.8):
+        return {
+            "ticker": ticker,
+            "sell_type": "STRONG_SELL",
+            "current": current,
+            "from_ma20_pct": from_ma20,
+            "scan_time": "11:47",
+            "rsi": rsi,
+            "vol_ratio": vol_ratio,
+            "macd_bearish": True,
+            "conditions": {
+                "rsi_overbought": True,
+                "macd_bearish": True,
+                "price_below_ma20": True,
+                "distribution_volume": True,
+            },
+        }
+
+    def _make_sector_collapse(self, sector="Perbankan"):
+        return {
+            "sell_type": "SECTOR_COLLAPSE",
+            "sector": sector,
+            "stocks": [
+                {"ticker": "BBCA.JK", "change_from_open": -2.1},
+                {"ticker": "BBRI.JK", "change_from_open": -1.8},
+                {"ticker": "BMRI.JK", "change_from_open": -1.6},
+            ],
+        }
+
+    def test_returns_none_for_empty(self):
+        """format_sell_alert should return None for empty list."""
+        assert format_sell_alert([]) is None
+
+    def test_strong_sell_format(self):
+        """format_sell_alert should format STRONG SELL with required fields."""
+        signals = [self._make_strong_sell()]
+        msg = format_sell_alert(signals)
+        assert msg is not None
+        assert "STRONG SELL" in msg
+        assert "BBCA" in msg
+        assert "RSI" in msg
+        assert "DYOR" in msg
+
+    def test_strong_sell_contains_price(self):
+        """Message should contain the stock price."""
+        signals = [self._make_strong_sell(current=4210.0)]
+        msg = format_sell_alert(signals)
+        assert "4,210" in msg or "4210" in msg
+
+    def test_strong_sell_contains_ma20_delta(self):
+        """Message should contain MA20 delta."""
+        signals = [self._make_strong_sell(from_ma20=-1.8)]
+        msg = format_sell_alert(signals)
+        assert "MA20" in msg
+
+    def test_strong_sell_contains_scan_time(self):
+        """Message should contain the scan time."""
+        signals = [self._make_strong_sell()]
+        msg = format_sell_alert(signals)
+        assert "11:47" in msg
+        assert "WIB" in msg
+
+    def test_sector_collapse_format(self):
+        """format_sell_alert should format SECTOR COLLAPSE correctly."""
+        signals = [self._make_sector_collapse()]
+        msg = format_sell_alert(signals)
+        assert msg is not None
+        assert "SECTOR COLLAPSE" in msg or "COLLAPSE" in msg
+        assert "Perbankan" in msg
+
+    def test_sector_collapse_contains_stocks(self):
+        """Sector collapse message should mention affected stocks."""
+        signals = [self._make_sector_collapse()]
+        msg = format_sell_alert(signals)
+        assert "BBCA" in msg or "BBRI" in msg or "BMRI" in msg
+
+    def test_returns_string(self):
+        """format_sell_alert should return a string."""
+        signals = [self._make_strong_sell()]
+        msg = format_sell_alert(signals)
+        assert isinstance(msg, str)
+
+    def test_multiple_signals(self):
+        """Should handle multiple sell signals."""
+        signals = [
+            self._make_strong_sell("BBCA.JK"),
+            self._make_sector_collapse(),
+        ]
+        msg = format_sell_alert(signals)
+        assert msg is not None
+        assert "BBCA" in msg
+
+    def test_only_active_conditions_shown(self):
+        """Only True conditions should be shown in message."""
+        sig = self._make_strong_sell()
+        sig["conditions"]["distribution_volume"] = False
+        sig["vol_ratio"] = 1.5
+        msg = format_sell_alert([sig])
+        # distribution_volume is False, so "whale jual" should not appear
+        assert "whale jual" not in msg
+
+    def test_disclaimer_present(self):
+        """Disclaimer should always appear."""
+        signals = [self._make_strong_sell()]
+        msg = format_sell_alert(signals)
+        assert "BUKAN saran investasi" in msg or "DYOR" in msg

@@ -282,6 +282,8 @@ def compute_signals(ticker: str, df: pd.DataFrame) -> dict:
         "near_arb": bool(near_arb),
         "signal": signal,
         "reasons": reasons,
+        "bb_upper": round(float(bb_upper), 0),
+        "bb_lower": round(float(bb_lower), 0),
     }
 
 
@@ -460,6 +462,276 @@ def format_realtime_alert(signals: list, scan_time: str) -> str:
     return "\n".join(lines)
 
 
+def classify_trading_style(signal: dict) -> dict:
+    """
+    Classify a signal as INTRADAY and/or SWING trade.
+
+    INTRADAY criteria (need 3/4):
+    - Volume > 1.5x avg
+    - RSI between 35–62
+    - Daily change > 0%
+    - Price NOT at upper Bollinger Band (price < upper_band * 0.99)
+
+    SWING criteria (INTRADAY + 2 more):
+    - MACD bullish
+    - MA20 > MA50 (uptrend)
+
+    Tags only assigned when score >= 5.
+    """
+    empty = {
+        "style": None,
+        "intraday_met": False,
+        "swing_met": False,
+        "intraday_tp": None,
+        "intraday_sl": None,
+        "swing_tp": None,
+        "swing_sl": None,
+    }
+
+    if not signal or signal.get("score", 0) < 5:
+        return empty
+
+    entry = float(signal.get("current", 0))
+    if entry <= 0:
+        return empty
+
+    bb_upper = float(signal.get("bb_upper", float("inf")))
+    if bb_upper <= 0:
+        bb_upper = float("inf")
+
+    # INTRADAY criteria (4 checks, need ≥3)
+    intraday_checks = {
+        "volume_1_5x": float(signal.get("vol_ratio", 0)) > 1.5,
+        "rsi_range": 35 <= float(signal.get("rsi", 0)) <= 62,
+        "positive_change": float(signal.get("daily_change_pct", 0)) > 0,
+        "not_near_upper_bb": entry < bb_upper * 0.99,
+    }
+    intraday_met = sum(intraday_checks.values()) >= 3
+
+    # SWING extra criteria (need INTRADAY + both below)
+    swing_extra = {
+        "macd_bullish": bool(signal.get("macd_bullish", False)),
+        "uptrend": bool(signal.get("conditions", {}).get("uptrend", False)),
+    }
+    swing_met = intraday_met and all(swing_extra.values())
+
+    # Tag assignment
+    if intraday_met and swing_met:
+        style = "🏃 INTRADAY + 📅 SWING"
+    elif intraday_met:
+        style = "🏃 INTRADAY"
+    elif swing_met:
+        style = "📅 SWING"
+    else:
+        style = None
+
+    result = {
+        "style": style,
+        "intraday_met": intraday_met,
+        "swing_met": swing_met,
+        "intraday_checks": intraday_checks,
+        "swing_extra": swing_extra,
+        "intraday_tp": None,
+        "intraday_sl": None,
+        "swing_tp": None,
+        "swing_sl": None,
+    }
+
+    if intraday_met:
+        result["intraday_tp"] = round(entry * 1.025, 0)
+        result["intraday_sl"] = round(entry * 0.98, 0)
+
+    if swing_met:
+        result["swing_tp"] = round(entry * 1.08, 0)
+        result["swing_sl"] = round(entry * 0.96, 0)
+
+    return result
+
+
+def scan_for_sell_signals(prev_signals: list = None) -> list:
+    """
+    Scan for SELL signals — runs every 10 min during market hours.
+
+    STRONG SELL triggers (need 3/4):
+    - RSI > 72 (overbought, whale distributing)
+    - MACD bearish crossover (last 3 candles)
+    - Price < MA20 (support broken)
+    - Volume > 2x avg (distribution volume)
+
+    SECTOR COLLAPSE:
+    - 3+ stocks in same sector all down > 1.5% from open
+    """
+    tickers_to_scan = [s["ticker"] for s in prev_signals] if prev_signals else WATCHLIST
+
+    sell_signals = []
+    sector_changes = {sector: [] for sector in SECTOR_MAP}
+
+    now_wib = datetime.utcnow() + timedelta(hours=7)
+    scan_time = now_wib.strftime("%H:%M")
+
+    for ticker in tickers_to_scan:
+        try:
+            df = get_stock_data(ticker)
+            if df is None or df.empty or len(df) < 20:
+                continue
+
+            close = df["Close"]
+            volume = df["Volume"]
+
+            current = float(close.iloc[-1])
+            open_today = float(df["Open"].iloc[-1])
+            change_from_open = ((current - open_today) / open_today) * 100
+
+            # MA20
+            ma20 = float(close.rolling(20).mean().iloc[-1])
+
+            # RSI (14)
+            delta_c = close.diff()
+            gain = delta_c.clip(lower=0).rolling(14).mean()
+            loss = (-delta_c.clip(upper=0)).rolling(14).mean()
+            rs = gain / loss
+            rsi = float((100 - (100 / (1 + rs))).iloc[-1])
+
+            # Volume
+            avg_vol_5d = float(volume.iloc[-6:-1].mean()) if len(volume) >= 6 else float(volume.mean())
+            vol_ratio = float(volume.iloc[-1]) / avg_vol_5d if avg_vol_5d > 0 else 1.0
+
+            # MACD bearish crossover (last 3 candles)
+            macd_line, signal_line = compute_macd(close)
+            macd_bearish_cross = False
+            if len(macd_line) >= 4:
+                ml = macd_line.iloc[-4:].values
+                sl_v = signal_line.iloc[-4:].values
+                for i in range(1, len(ml)):
+                    if not np.isnan(ml[i]) and not np.isnan(sl_v[i]):
+                        if ml[i] < sl_v[i] and ml[i - 1] >= sl_v[i - 1]:
+                            macd_bearish_cross = True
+                            break
+
+            # Sector tracking
+            for sector, sector_tickers in SECTOR_MAP.items():
+                if ticker in sector_tickers:
+                    sector_changes[sector].append({
+                        "ticker": ticker,
+                        "change_from_open": change_from_open,
+                    })
+
+            # STRONG SELL conditions
+            from_ma20_pct = ((current - ma20) / ma20) * 100
+            sell_conditions = {
+                "rsi_overbought": bool(rsi > 72),
+                "macd_bearish": bool(macd_bearish_cross),
+                "price_below_ma20": bool(current < ma20),
+                "distribution_volume": bool(vol_ratio > 2.0),
+            }
+
+            if sum(sell_conditions.values()) >= 3:
+                sell_signals.append({
+                    "ticker": ticker,
+                    "current": round(current, 0),
+                    "from_ma20_pct": round(from_ma20_pct, 1),
+                    "scan_time": scan_time,
+                    "rsi": round(rsi, 1),
+                    "vol_ratio": round(vol_ratio, 2),
+                    "macd_bearish": bool(macd_bearish_cross),
+                    "conditions": sell_conditions,
+                    "sell_type": "STRONG_SELL",
+                })
+
+        except Exception as e:
+            print(f"[Scanner] Sell scan error {ticker}: {e}")
+
+    # Sector collapse check
+    for sector, changes in sector_changes.items():
+        down_stocks = [c for c in changes if c["change_from_open"] <= -1.5]
+        if len(down_stocks) >= 3:
+            sell_signals.append({
+                "sector": sector,
+                "stocks": down_stocks,
+                "sell_type": "SECTOR_COLLAPSE",
+            })
+
+    return sell_signals
+
+
+def format_sell_alert(sell_signals: list) -> str:
+    """Format SELL signal alerts for Telegram."""
+    if not sell_signals:
+        return None
+
+    parts = []
+    for s in sell_signals:
+        if s["sell_type"] == "STRONG_SELL":
+            ticker_clean = s["ticker"].replace(".JK", "")
+            cond = s["conditions"]
+            lines = [
+                f"🔴 <b>STRONG SELL — {ticker_clean}</b>",
+                "",
+                f"📍 Harga: Rp {s['current']:,.0f}",
+                f"📉 Dari MA20: {s['from_ma20_pct']:+.1f}%",
+                f"⏰ {s['scan_time']} WIB",
+                "",
+            ]
+            if cond.get("rsi_overbought"):
+                lines.append(f"❌ RSI {s['rsi']} (distribusi)")
+            if cond.get("macd_bearish"):
+                lines.append("❌ MACD bearish crossover")
+            if cond.get("price_below_ma20"):
+                lines.append("❌ Break di bawah MA20")
+            if cond.get("distribution_volume"):
+                lines.append(f"❌ Volume {s['vol_ratio']}x (whale jual)")
+            lines.append("")
+            lines.append("💡 Konfirmasi kuat: keluar sekarang.")
+            lines.append("⚠️ BUKAN saran investasi. DYOR.")
+            parts.append("\n".join(lines))
+
+        elif s["sell_type"] == "SECTOR_COLLAPSE":
+            sector = s.get("sector", "Unknown")
+            tickers_str = ", ".join(
+                t["ticker"].replace(".JK", "") for t in s.get("stocks", [])
+            )
+            lines = [
+                f"🔴 <b>SECTOR COLLAPSE — {sector}</b>",
+                "",
+                "📉 3+ saham turun >1.5% dari open:",
+                f"   {tickers_str}",
+                "",
+                "⚠️ Pertimbangkan reduce exposure sektor ini.",
+                "⚠️ BUKAN saran investasi. DYOR.",
+            ]
+            parts.append("\n".join(lines))
+
+    return "\n\n".join(parts) if parts else None
+
+
+def run_sell_scan(prev_signals: list = None) -> list:
+    """Run sell signal scan and send alert if any found."""
+    try:
+        # Load morning signals if not provided
+        if prev_signals is None:
+            path = "data/signals_today.json"
+            if os.path.exists(path):
+                with open(path) as f:
+                    data = json.load(f)
+                prev_signals = data.get("signals", [])
+
+        sell_signals = scan_for_sell_signals(prev_signals)
+
+        if sell_signals:
+            msg = format_sell_alert(sell_signals)
+            if msg:
+                ok = send_telegram(msg)
+                print(f"[Scanner] Sell alert sent: {ok} ({len(sell_signals)} signals)")
+        else:
+            now_wib = datetime.utcnow() + timedelta(hours=7)
+            print(f"[Scanner] No sell signals at {now_wib.strftime('%H:%M')} WIB")
+
+        return sell_signals
+    except Exception as e:
+        print(f"[Scanner] run_sell_scan ERROR: {e}")
+        return []
+
+
 def save_signals(signals: list, path: str = "data/signals_today.json"):
     """Save today's signals for delta report at close"""
     os.makedirs(os.path.dirname(path) if os.path.dirname(path) else "data", exist_ok=True)
@@ -540,7 +812,10 @@ def run_realtime_scan():
 
 
 def run_closing_report():
-    """Run at 15:35 WIB — after market close. Show delta."""
+    """
+    Run at 15:35 WIB — after market close.
+    EOD Delta Report: exact format with Win/Loss/Accuracy summary.
+    """
     path = "data/signals_today.json"
     if not os.path.exists(path):
         print("[Scanner] No morning signals found for delta report")
@@ -551,40 +826,61 @@ def run_closing_report():
 
     morning_signals = {
         s["ticker"]: s for s in data["signals"]
-        if s["signal"] in ["STRONG BUY", "BUY", "WATCH"]
+        if s["signal"] in ["STRONG BUY", "WATCH"]
     }
 
     if not morning_signals:
         return
 
     now_wib = datetime.utcnow() + timedelta(hours=7)
+    date_str = now_wib.strftime("%d %b %Y")
+
     lines = [
-        f"📊 <b>DAILY DELTA REPORT — {now_wib.strftime('%d %b %Y')} WIB</b>",
+        f"📊 <b>DAILY DELTA REPORT — {date_str}</b>",
         "",
     ]
+
+    wins = 0
+    losses = 0
 
     for ticker, morning in morning_signals.items():
         try:
             df = get_stock_data(ticker, period="2d")
             if df.empty:
                 continue
-            close_price = df["Close"].iloc[-1]
-            open_price = df["Open"].iloc[-1]
+            close_price = float(df["Close"].iloc[-1])
+            open_price = float(df["Open"].iloc[-1])
+            entry = float(morning["current"])
+
             delta = ((close_price - open_price) / open_price) * 100
-            from_morning = ((close_price - morning["current"]) / morning["current"]) * 100
+            vs_pagi = ((close_price - entry) / entry) * 100
+
             emoji = "🟢" if delta > 0 else "🔴"
+            if delta > 0:
+                wins += 1
+            else:
+                losses += 1
+
             ticker_clean = ticker.replace(".JK", "")
             lines.append(
                 f"{emoji} <b>{ticker_clean}</b> "
                 f"Open: {open_price:,.0f} → Close: {close_price:,.0f} "
                 f"| Delta: {delta:+.2f}% "
-                f"| vs Pagi: {from_morning:+.2f}%"
+                f"| vs Pagi: {vs_pagi:+.2f}%"
             )
         except Exception as e:
             print(f"[Scanner] Error in closing report for {ticker}: {e}")
 
+    total = wins + losses
+    accuracy = round((wins / total) * 100, 1) if total > 0 else 0.0
+
     lines.append("")
-    lines.append("📈 <i>Track record untuk evaluasi sinyal ke depan.</i>")
+    lines.append(
+        f"📈 Win: {wins} sinyal profit | Loss: {losses} | Akurasi: {accuracy:.1f}%"
+    )
+    lines.append("")
+    lines.append("⚠️ <i>BUKAN saran investasi. DYOR.</i>")
+
     send_telegram("\n".join(lines))
     print("[Scanner] Closing delta report sent")
 
@@ -595,5 +891,7 @@ if __name__ == "__main__":
         run_closing_report()
     elif len(sys.argv) > 1 and sys.argv[1] == "realtime":
         run_realtime_scan()
+    elif len(sys.argv) > 1 and sys.argv[1] == "sell":
+        run_sell_scan()
     else:
         run_morning_scan()

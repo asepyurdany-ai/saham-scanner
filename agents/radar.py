@@ -356,6 +356,113 @@ def format_geo_alert(analyses: list) -> str:
     return "\n".join(lines)
 
 
+MACRO_SHOCK_PRIORITY_STOCKS = ["GOTO", "BUKA", "BMRI"]
+
+
+def check_macro_shock() -> list:
+    """
+    Check for intraday macro shocks:
+    - USD/IDR moves > 1.5% intraday → MACRO SHOCK
+    - WTI Oil moves > 3% intraday → MACRO SHOCK
+
+    Uses today's open vs current price for intraday move.
+    Returns list of shock dicts (may be empty).
+    """
+    shocks = []
+    now_wib = datetime.utcnow() + timedelta(hours=7)
+    scan_time = now_wib.strftime("%H:%M")
+
+    shock_checks = [
+        ("USD/IDR", "IDR=X", 1.5),
+        ("WTI Oil", "CL=F", 3.0),
+    ]
+
+    for name, ticker_sym, threshold in shock_checks:
+        try:
+            t = yf.Ticker(ticker_sym)
+            hist = t.history(period="1d", interval="5m")
+            if hist is None or hist.empty:
+                # Fallback: use daily data
+                hist = t.history(period="2d")
+                if hist is None or hist.empty:
+                    continue
+                open_price = float(hist["Open"].iloc[-1])
+                current_price = float(hist["Close"].iloc[-1])
+            else:
+                open_price = float(hist["Open"].iloc[0])
+                current_price = float(hist["Close"].iloc[-1])
+
+            if open_price <= 0:
+                continue
+
+            change_pct = ((current_price - open_price) / open_price) * 100
+
+            if abs(change_pct) >= threshold:
+                shocks.append({
+                    "name": name,
+                    "current": round(current_price, 2),
+                    "open": round(open_price, 2),
+                    "change_pct": round(change_pct, 2),
+                    "threshold": threshold,
+                    "scan_time": scan_time,
+                })
+        except Exception as e:
+            print(f"[Radar] Macro shock check error {name}: {e}")
+
+    return shocks
+
+
+def format_macro_shock_alert(shocks: list) -> str:
+    """Format macro shock alert for Telegram."""
+    if not shocks:
+        return None
+
+    now_wib = datetime.utcnow() + timedelta(hours=7)
+    scan_time = now_wib.strftime("%H:%M")
+
+    lines = [f"🌍 <b>MACRO SHOCK — {scan_time} WIB</b>", ""]
+
+    for shock in shocks:
+        sign = "+" if shock["change_pct"] > 0 else ""
+        name = shock["name"]
+        current = shock["current"]
+        change_pct = shock["change_pct"]
+
+        if name == "USD/IDR":
+            lines.append(f"💵 {name}: {current:,.0f} ({sign}{change_pct:.1f}% intraday) ‼️")
+            if change_pct > 0:
+                lines.append("Rupiah melemah tajam → potensi capital outflow.")
+            else:
+                lines.append("Rupiah menguat tajam → potensi capital inflow.")
+        else:
+            lines.append(f"🛢 {name}: {current:.2f} ({sign}{change_pct:.1f}% intraday) ‼️")
+            if change_pct > 0:
+                lines.append("Minyak naik tajam → tekanan inflasi. Watch: MEDC, AKRA.")
+            else:
+                lines.append("Minyak turun tajam → tekanan sektor energi.")
+
+    priority = ", ".join(MACRO_SHOCK_PRIORITY_STOCKS)
+    lines.append("")
+    lines.append("⚠️ Pertimbangkan reduce exposure.")
+    lines.append(f"Prioritas exit: {priority}")
+
+    return "\n".join(lines)
+
+
+def run_macro_shock_check() -> list:
+    """Check macro shock — called every 5 min during market hours."""
+    print("[Radar] Checking macro shock...")
+    shocks = check_macro_shock()
+    if shocks:
+        msg = format_macro_shock_alert(shocks)
+        if msg:
+            ok = send_telegram(msg)
+            print(f"[Radar] Macro shock alert sent: {ok}")
+    else:
+        print("[Radar] No macro shock detected")
+    return shocks
+
+
 def run_commodity_check():
     """Check commodity prices — alert if >2% move"""
     print("[Radar] Checking commodities...")
