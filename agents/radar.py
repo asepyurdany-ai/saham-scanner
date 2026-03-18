@@ -267,7 +267,8 @@ Format JSON array — satu objek per berita yang relevan:
   "level": "TINGGI/SEDANG/RENDAH",
   "saham_terdampak": ["BBCA", "MEDC"],
   "alasan": "penjelasan singkat mengapa saham ini terdampak",
-  "analisa": "1 kalimat ringkasan dalam Bahasa Indonesia"
+  "analisa": "1 kalimat ringkasan dalam Bahasa Indonesia",
+  "reasoning": "rantai logika detail: dari event → mekanisme transmisi → dampak ke sektor/saham IHSG"
 }}]
 
 Berita:
@@ -282,8 +283,8 @@ Rules:
 
     try:
         response = client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=800,
+            model="claude-sonnet-4-5",
+            max_tokens=1500,
             messages=[{"role": "user", "content": prompt}]
         )
         raw = response.content[0].text.strip()

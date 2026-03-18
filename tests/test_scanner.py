@@ -1,6 +1,7 @@
 """
 Unit tests for agents/scanner.py
-Tests: compute_signals (buy/watch/avoid), save_signals, format_morning_alert
+Tests: compute_signals (strong_buy/watch/avoid), save_signals, format_morning_alert
+Updated for: 6-condition scoring, MACD/BB, STRONG BUY threshold (5/6), TP/SL
 """
 
 import json
@@ -13,18 +14,22 @@ import pytest
 # Ensure project root on path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from agents.scanner import compute_signals, save_signals, format_morning_alert
+from agents.scanner import compute_signals, save_signals, format_morning_alert, compute_macd
 
 
-def make_df(prices, volumes=None):
+def make_df(prices, volumes=None, highs=None, lows=None):
     """Helper: create OHLCV DataFrame from price list."""
     if volumes is None:
         volumes = [1_000_000] * len(prices)
+    if highs is None:
+        highs = [p * 1.01 for p in prices]
+    if lows is None:
+        lows = [p * 0.98 for p in prices]
     dates = pd.date_range("2026-01-01", periods=len(prices), freq="D")
     df = pd.DataFrame({
         "Open": [p * 0.99 for p in prices],
-        "High": [p * 1.01 for p in prices],
-        "Low": [p * 0.98 for p in prices],
+        "High": highs,
+        "Low": lows,
         "Close": prices,
         "Volume": volumes,
     }, index=dates)
@@ -33,86 +38,109 @@ def make_df(prices, volumes=None):
 
 def make_buy_df():
     """
-    Create a DataFrame that should produce a BUY signal (score >= 4).
-    - Uptrend: first 5 rows flat/lower so MA50 < MA20
-    - RSI in 30-65 range (mixed up/down)
-    - Volume spike on last day
-    - Positive momentum on last day
-    - Daily change well below ARA limit
+    35-row uptrend DataFrame → STRONG BUY (score 5-6).
+    Conditions met:
+      1. uptrend: MA20 > MA50  ✅
+      2. volume_spike: last day 2.4x  ✅
+      3. rsi_ok: RSI ~50 (mixed days)  ✅
+      4. price_above_ma20: rising price  ✅
+      5. macd_bullish: EMA12 > EMA26 in uptrend  ✅
+      6. momentum_positive: last day up  ✅
     """
-    # 25 rows: steady uptrend with mixed days for RSI control
+    # 35 rows, steady uptrend with mixed days for RSI moderation
     prices = [
-        1000, 1002, 999, 1004, 1001, 1006, 1003, 1008, 1005, 1010,
-        1007, 1012, 1009, 1014, 1011, 1016, 1013, 1018, 1015, 1020,
-        1017, 1022, 1019, 1024, 1026,  # last day positive
+        1000, 1002, 999, 1004, 1001,
+        1006, 1003, 1008, 1005, 1010,
+        1007, 1012, 1009, 1014, 1011,
+        1016, 1013, 1018, 1015, 1020,
+        1017, 1022, 1019, 1024, 1021,
+        1026, 1023, 1028, 1025, 1030,
+        1027, 1032, 1029, 1034, 1036,  # last day positive
     ]
-    # Volumes: normal for first 24 days, spike on last day
-    volumes = [500_000] * 24 + [1_200_000]  # vol_ratio = 1.2M / 500K = 2.4x
-
+    # Volume spike on last day: 1.2M vs 500K avg = 2.4x
+    volumes = [500_000] * 34 + [1_200_000]
     return make_df(prices, volumes)
 
 
 def make_watch_df():
     """
-    Create a DataFrame that should produce WATCH signal (score == 3).
-    - RSI slightly above 65 → rsi_ok = False (1 condition fails)
-    - Uptrend: True
-    - Volume spike: True
-    - Momentum: positive
-    - Not approaching ARA: True
-    RSI >65 means rsi_ok = False, so score = 4 conditions... hmm.
-    Let me make 2 conditions fail:
-    - No uptrend (flat prices)
-    - Volume normal (no spike)
+    35-row flat DataFrame → WATCH (score 3-4).
+    - No uptrend (flat MA20 ≈ MA50)
+    - No volume spike
+    - RSI ok, momentum ok, price near MA20
     """
-    # Flat prices (MA20 == MA50 approximately) → uptrend = False
-    # Positive momentum last day, RSI ok, not approaching limit
     base = 2000.0
-    prices = [base + (i % 3) * 2 for i in range(24)] + [base + 8]  # slight positive last day
-    volumes = [300_000] * 25  # no volume spike → vol_ratio ≈ 1
-
+    prices = [base + (i % 3) * 2 for i in range(34)] + [base + 8]
+    volumes = [300_000] * 35
     return make_df(prices, volumes)
 
 
 def make_avoid_df():
     """
-    Create a DataFrame that should produce AVOID signal (score < 3).
-    - Downtrend
-    - No volume spike
-    - RSI potentially low
-    - Negative momentum
+    35-row downtrend → AVOID (score < 3).
+    All conditions fail: downtrend, no spike, negative RSI territory, below MA, negative MACD
     """
-    # Declining prices
-    prices = [3000 - i * 5 for i in range(25)]
-    volumes = [200_000] * 25
-
+    prices = [3000 - i * 5 for i in range(35)]  # 3000 → 2830
+    volumes = [200_000] * 35
     return make_df(prices, volumes)
 
 
-# --- Tests ---
+# ─── Tests: compute_macd ────────────────────────────────────────────────────
+
+class TestComputeMacd:
+
+    def test_returns_two_series(self):
+        """compute_macd should return (macd_line, signal_line) Series."""
+        prices = pd.Series([float(x) for x in range(1000, 1035)])
+        macd_line, signal_line = compute_macd(prices)
+        assert isinstance(macd_line, pd.Series)
+        assert isinstance(signal_line, pd.Series)
+        assert len(macd_line) == len(prices)
+        assert len(signal_line) == len(prices)
+
+    def test_macd_bullish_in_uptrend(self):
+        """In a consistent uptrend, MACD line should be above signal line."""
+        prices = pd.Series([float(1000 + i * 10) for i in range(35)])
+        macd_line, signal_line = compute_macd(prices)
+        # Last value: MACD > signal in strong uptrend
+        assert macd_line.iloc[-1] > signal_line.iloc[-1]
+
+    def test_macd_bearish_in_downtrend(self):
+        """In a consistent downtrend, MACD line should be below signal line."""
+        prices = pd.Series([float(3000 - i * 10) for i in range(35)])
+        macd_line, signal_line = compute_macd(prices)
+        assert macd_line.iloc[-1] < signal_line.iloc[-1]
+
+    def test_custom_params(self):
+        """compute_macd should accept custom fast/slow/signal params."""
+        prices = pd.Series([float(x) for x in range(1000, 1035)])
+        macd_line, signal_line = compute_macd(prices, fast=5, slow=10, signal=3)
+        assert len(macd_line) == len(prices)
+
+
+# ─── Tests: compute_signals ─────────────────────────────────────────────────
 
 class TestComputeSignals:
 
-    def test_buy_signal(self):
-        """compute_signals should return BUY for strong uptrend with volume spike."""
+    def test_strong_buy_signal(self):
+        """compute_signals should return STRONG BUY for strong uptrend with volume spike."""
         df = make_buy_df()
         result = compute_signals("BBCA.JK", df)
 
         assert result is not None
         assert result["ticker"] == "BBCA.JK"
-        assert result["signal"] == "BUY"
-        assert result["score"] >= 4
+        assert result["signal"] == "STRONG BUY"
+        assert result["score"] >= 5
 
     def test_watch_signal(self):
-        """compute_signals should return WATCH for moderate conditions (score 3)."""
+        """compute_signals should return WATCH for moderate conditions (score 3-4)."""
         df = make_watch_df()
         result = compute_signals("TLKM.JK", df)
 
         assert result is not None
         assert result["ticker"] == "TLKM.JK"
-        assert result["signal"] in ("WATCH", "BUY", "AVOID")  # flexible: just ensure it runs
-        # More importantly: score is between 0-5
-        assert 0 <= result["score"] <= 5
+        assert result["signal"] in ("STRONG BUY", "WATCH", "AVOID")
+        assert 0 <= result["score"] <= 6
 
     def test_avoid_signal(self):
         """compute_signals should return AVOID for downtrend with no volume spike."""
@@ -144,17 +172,18 @@ class TestComputeSignals:
             "ticker", "current", "prev_close", "daily_change_pct",
             "ma20", "ma50", "rsi", "vol_ratio", "score", "conditions",
             "approaching_ara", "near_arb", "signal",
+            "macd_bullish", "macd_crossover", "tp", "sl", "tp_pct", "sl_pct",
         ]
         for key in required_keys:
             assert key in result, f"Missing key: {key}"
 
     def test_signal_values_are_valid(self):
-        """Signal must be one of BUY/WATCH/AVOID."""
+        """Signal must be one of STRONG BUY/WATCH/AVOID."""
         for make_fn in [make_buy_df, make_watch_df, make_avoid_df]:
             df = make_fn()
             result = compute_signals("BBCA.JK", df)
             if result:
-                assert result["signal"] in ("BUY", "WATCH", "AVOID")
+                assert result["signal"] in ("STRONG BUY", "WATCH", "AVOID")
 
     def test_rsi_range(self):
         """RSI should be between 0 and 100."""
@@ -163,14 +192,28 @@ class TestComputeSignals:
         if result:
             assert 0 <= result["rsi"] <= 100
 
-    def test_conditions_dict_has_5_keys(self):
-        """conditions dict should have exactly 5 boolean keys."""
+    def test_conditions_dict_has_6_keys(self):
+        """conditions dict should have exactly 6 boolean keys."""
         df = make_buy_df()
         result = compute_signals("BBCA.JK", df)
         if result:
-            assert len(result["conditions"]) == 5
+            assert len(result["conditions"]) == 6, (
+                f"Expected 6 conditions, got {len(result['conditions'])}: "
+                f"{list(result['conditions'].keys())}"
+            )
             for v in result["conditions"].values():
                 assert isinstance(v, bool)
+
+    def test_conditions_keys(self):
+        """conditions dict should have the correct 6 named keys."""
+        df = make_buy_df()
+        result = compute_signals("BBCA.JK", df)
+        if result:
+            expected_keys = {
+                "uptrend", "volume_spike", "rsi_ok",
+                "price_above_ma20", "macd_bullish", "momentum_positive"
+            }
+            assert set(result["conditions"].keys()) == expected_keys
 
     def test_score_matches_conditions(self):
         """score should equal sum of True conditions."""
@@ -180,13 +223,13 @@ class TestComputeSignals:
             expected = sum(result["conditions"].values())
             assert result["score"] == expected
 
-    def test_buy_signal_score_at_least_4(self):
-        """BUY signal must have score >= 4."""
+    def test_strong_buy_signal_score_at_least_5(self):
+        """STRONG BUY signal must have score >= 5."""
         df = make_buy_df()
         result = compute_signals("BBCA.JK", df)
         assert result is not None
-        assert result["score"] >= 4
-        assert result["signal"] == "BUY"
+        assert result["score"] >= 5
+        assert result["signal"] == "STRONG BUY"
 
     def test_avoid_signal_score_less_than_3(self):
         """AVOID signal must have score < 3."""
@@ -196,36 +239,89 @@ class TestComputeSignals:
         assert result["score"] < 3
         assert result["signal"] == "AVOID"
 
+    def test_tp_sl_calculation(self):
+        """TP should be +8%, SL should be -4% of entry price."""
+        df = make_buy_df()
+        result = compute_signals("BBCA.JK", df)
+        if result:
+            current = result["current"]
+            expected_tp = round(current * 1.08, 0)
+            expected_sl = round(current * 0.96, 0)
+            assert result["tp"] == expected_tp
+            assert result["sl"] == expected_sl
+
+    def test_macd_fields_present(self):
+        """macd_bullish and macd_crossover should be booleans."""
+        df = make_buy_df()
+        result = compute_signals("BBCA.JK", df)
+        if result:
+            assert isinstance(result["macd_bullish"], bool)
+            assert isinstance(result["macd_crossover"], bool)
+
+    def test_macd_bullish_in_uptrend(self):
+        """In an uptrend, macd_bullish should be True."""
+        df = make_buy_df()
+        result = compute_signals("BBCA.JK", df)
+        if result:
+            assert result["macd_bullish"] is True
+
+    def test_rsi_ok_condition_range(self):
+        """rsi_ok should be True only when 25 < RSI < 70."""
+        df = make_buy_df()
+        result = compute_signals("BBCA.JK", df)
+        if result:
+            rsi = result["rsi"]
+            expected = rsi > 25 and rsi < 70
+            assert result["conditions"]["rsi_ok"] == expected
+
+    def test_price_above_ma20_condition(self):
+        """price_above_ma20 should reflect current vs MA20."""
+        df = make_buy_df()
+        result = compute_signals("BBCA.JK", df)
+        if result:
+            expected = result["current"] > result["ma20"]
+            assert result["conditions"]["price_above_ma20"] == expected
+
+
+# ─── Tests: save_signals ────────────────────────────────────────────────────
 
 class TestSaveSignals:
+
+    def _make_signal_dict(self, ticker="BBCA.JK", signal="STRONG BUY", score=5):
+        return {
+            "ticker": ticker,
+            "current": 9500.0,
+            "prev_close": 9400.0,
+            "daily_change_pct": 1.06,
+            "ma20": 9300.0,
+            "ma50": 9100.0,
+            "rsi": 55.0,
+            "vol_ratio": 2.5,
+            "macd_bullish": True,
+            "macd_crossover": False,
+            "tp": 10260.0,
+            "sl": 9120.0,
+            "tp_pct": 8.0,
+            "sl_pct": -4.0,
+            "score": score,
+            "conditions": {
+                "uptrend": True,
+                "volume_spike": True,
+                "rsi_ok": True,
+                "price_above_ma20": True,
+                "macd_bullish": True,
+                "momentum_positive": False,
+            },
+            "approaching_ara": False,
+            "near_arb": False,
+            "signal": signal,
+            "reasons": ["Test reason"],
+        }
 
     def test_save_creates_file(self, tmp_path):
         """save_signals should create JSON file."""
         path = str(tmp_path / "signals_test.json")
-        signals = [
-            {
-                "ticker": "BBCA.JK",
-                "current": 9500.0,
-                "prev_close": 9400.0,
-                "daily_change_pct": 1.06,
-                "ma20": 9300.0,
-                "ma50": 9100.0,
-                "rsi": 55.0,
-                "vol_ratio": 2.5,
-                "score": 4,
-                "conditions": {
-                    "uptrend": True,
-                    "volume_spike": True,
-                    "rsi_ok": True,
-                    "momentum_positive": True,
-                    "not_approaching_limit": False,
-                },
-                "approaching_ara": True,
-                "near_arb": False,
-                "signal": "BUY",
-                "reasons": ["Test reason"],
-            }
-        ]
+        signals = [self._make_signal_dict()]
         save_signals(signals, path=path)
 
         assert os.path.exists(path)
@@ -248,13 +344,20 @@ class TestSaveSignals:
                 "ma50": np.float64(3900.0),
                 "rsi": np.float64(58.0),
                 "vol_ratio": np.float64(1.8),
+                "macd_bullish": True,
+                "macd_crossover": False,
+                "tp": np.float64(4536.0),
+                "sl": np.float64(4032.0),
+                "tp_pct": 8.0,
+                "sl_pct": -4.0,
                 "score": np.int64(3),
                 "conditions": {
                     "uptrend": True,
                     "volume_spike": False,
                     "rsi_ok": True,
+                    "price_above_ma20": True,
+                    "macd_bullish": False,
                     "momentum_positive": True,
-                    "not_approaching_limit": True,
                 },
                 "approaching_ara": False,
                 "near_arb": False,
@@ -262,7 +365,6 @@ class TestSaveSignals:
                 "reasons": [],
             }
         ]
-        # Should not raise
         save_signals(signals, path=path)
         assert os.path.exists(path)
 
@@ -280,6 +382,12 @@ class TestSaveSignals:
                 "ma50": 900.0,
                 "rsi": 50.0,
                 "vol_ratio": 1.5,
+                "macd_bullish": True,
+                "macd_crossover": False,
+                "tp": 1080.0,
+                "sl": 960.0,
+                "tp_pct": 8.0,
+                "sl_pct": -4.0,
                 "score": 3,
                 "conditions": {},
                 "approaching_ara": False,
@@ -301,9 +409,11 @@ class TestSaveSignals:
         assert data["signals"] == []
 
 
+# ─── Tests: format_morning_alert ────────────────────────────────────────────
+
 class TestFormatMorningAlert:
 
-    def _make_signal(self, ticker="BBCA.JK", signal="BUY", score=4, vol_ratio=2.5):
+    def _make_signal(self, ticker="BBCA.JK", signal="STRONG BUY", score=5, vol_ratio=2.5):
         return {
             "ticker": ticker,
             "current": 9500.0,
@@ -313,22 +423,35 @@ class TestFormatMorningAlert:
             "ma50": 9100.0,
             "rsi": 55.0,
             "vol_ratio": vol_ratio,
+            "macd_bullish": True,
+            "macd_crossover": False,
+            "tp": 10260.0,
+            "sl": 9120.0,
+            "tp_pct": 8.0,
+            "sl_pct": -4.0,
             "score": score,
-            "conditions": {},
+            "conditions": {
+                "uptrend": True,
+                "volume_spike": True,
+                "rsi_ok": True,
+                "price_above_ma20": True,
+                "macd_bullish": True,
+                "momentum_positive": False,
+            },
             "approaching_ara": False,
             "near_arb": False,
             "signal": signal,
             "reasons": ["Uptrend confirmed", "Volume spike"],
         }
 
-    def test_format_with_buy_signals(self):
-        """format_morning_alert should include BUY signals in output."""
-        signals = [self._make_signal("BBCA.JK", "BUY", 4)]
+    def test_format_with_strong_buy_signals(self):
+        """format_morning_alert should include STRONG BUY signals in output."""
+        signals = [self._make_signal("BBCA.JK", "STRONG BUY", 5)]
         msg = format_morning_alert(signals)
 
         assert "MORNING SCAN" in msg
         assert "BBCA" in msg
-        assert "BUY" in msg.upper() or "STRONG" in msg
+        assert "STRONG BUY" in msg
 
     def test_format_with_watch_signals(self):
         """format_morning_alert should include WATCH signals."""
@@ -368,17 +491,16 @@ class TestFormatMorningAlert:
 
     def test_format_whale_indicator(self):
         """format_morning_alert should show whale indicator for vol_ratio >= 2."""
-        signals = [self._make_signal("BBCA.JK", "BUY", 4, vol_ratio=3.0)]
+        signals = [self._make_signal("BBCA.JK", "STRONG BUY", 5, vol_ratio=3.0)]
         msg = format_morning_alert(signals)
 
         assert "🐋" in msg
 
     def test_format_no_whale_indicator(self):
         """No whale indicator when vol_ratio < 2."""
-        signals = [self._make_signal("BBCA.JK", "BUY", 4, vol_ratio=1.5)]
+        signals = [self._make_signal("BBCA.JK", "STRONG BUY", 5, vol_ratio=1.5)]
         msg = format_morning_alert(signals)
 
-        # Should not have whale indicator
         assert "🐋" not in msg
 
     def test_format_disclaimer_present(self):
@@ -392,10 +514,24 @@ class TestFormatMorningAlert:
         assert isinstance(msg, str)
 
     def test_format_limits_buy_to_5(self):
-        """format_morning_alert should show at most 5 BUY signals."""
-        signals = [self._make_signal(f"STOCK{i}.JK", "BUY", 4) for i in range(10)]
+        """format_morning_alert should show at most 5 STRONG BUY signals."""
+        signals = [self._make_signal(f"STOCK{i}.JK", "STRONG BUY", 5) for i in range(10)]
         msg = format_morning_alert(signals)
 
-        # Count occurrences of tickers (STOCK0 through STOCK9)
         shown = sum(1 for i in range(10) if f"STOCK{i}" in msg)
         assert shown <= 5
+
+    def test_format_contains_tp_sl(self):
+        """format_morning_alert should show TP and SL for STRONG BUY signals."""
+        signals = [self._make_signal("BBCA.JK", "STRONG BUY", 5)]
+        msg = format_morning_alert(signals)
+
+        assert "TP" in msg
+        assert "SL" in msg
+
+    def test_format_score_out_of_6(self):
+        """format_morning_alert should show score as X/6."""
+        signals = [self._make_signal("BBCA.JK", "STRONG BUY", 5)]
+        msg = format_morning_alert(signals)
+
+        assert "5/6" in msg

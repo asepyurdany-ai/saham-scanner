@@ -1,6 +1,6 @@
 """
 Scanner Agent — Technical analysis + Whale detection + Macro context
-Hedge fund discipline: only strong signals pass
+Hedge fund discipline: STRONG BUY only when 5/6 conditions met
 Real-time monitoring every 10 min during market hours (08:55-15:00 WIB)
 """
 
@@ -75,8 +75,8 @@ def send_telegram(msg: str, retries: int = 3) -> bool:
     return False
 
 
-def get_stock_data(ticker: str, period: str = "25d", retries: int = 2) -> pd.DataFrame:
-    """Fetch OHLCV from Yahoo Finance with retry"""
+def get_stock_data(ticker: str, period: str = "60d", retries: int = 2) -> pd.DataFrame:
+    """Fetch OHLCV from Yahoo Finance with retry. 60d for MACD accuracy."""
     for attempt in range(retries):
         try:
             stock = yf.Ticker(ticker)
@@ -115,11 +115,32 @@ def get_macro_data() -> dict:
     return macro
 
 
+def compute_macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
+    """Compute MACD line and signal line."""
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    return macd_line, signal_line
+
+
 def compute_signals(ticker: str, df: pd.DataFrame) -> dict:
     """
     Compute technical signals.
-    Hedge fund rule: need 4/5 conditions for strong signal.
-    Enhanced with richer reasoning.
+    Hedge fund rule: need 5/6 conditions for STRONG BUY.
+
+    Conditions:
+      1. Trend naik: MA20 > MA50
+      2. Volume spike: vol > 2x avg 5 hari (whale)
+      3. RSI sehat: RSI < 70 AND > 25 (tidak oversold extreme)
+      4. Price above MA20
+      5. MACD bullish (MACD line > Signal line OR crossover in last 3 candles)
+      6. Momentum: daily change > 0%
+
+    Signal levels:
+      STRONG BUY: score 5-6
+      WATCH:      score 3-4
+      AVOID:      score < 3
     """
     if df.empty or len(df) < 20:
         return None
@@ -141,7 +162,7 @@ def compute_signals(ticker: str, df: pd.DataFrame) -> dict:
     rsi_series = (100 - (100 / (1 + rs)))
     rsi = rsi_series.iloc[-1]
 
-    # Volume analysis (whale detection)
+    # Volume analysis (whale detection) — avg 5 days before today
     avg_vol_5d = volume.iloc[-6:-1].mean()
     today_vol = volume.iloc[-1]
     vol_ratio = today_vol / avg_vol_5d if avg_vol_5d > 0 else 1.0
@@ -149,7 +170,7 @@ def compute_signals(ticker: str, df: pd.DataFrame) -> dict:
     # Daily change
     daily_change_pct = ((current - prev_close) / prev_close) * 100
 
-    # ARA/ARB detection (simplified — IDX rules vary by price range)
+    # ARA/ARB detection (simplified)
     if current < 200:
         ara_limit = 0.35
         arb_limit = -0.07
@@ -160,29 +181,58 @@ def compute_signals(ticker: str, df: pd.DataFrame) -> dict:
         ara_limit = 0.20
         arb_limit = -0.07
 
-    approaching_ara = daily_change_pct >= (ara_limit * 100 * 0.7)  # 70% of ARA
-    near_arb = daily_change_pct <= (arb_limit * 100 * 0.5)        # 50% of ARB
+    approaching_ara = daily_change_pct >= (ara_limit * 100 * 0.7)
+    near_arb = daily_change_pct <= (arb_limit * 100 * 0.5)
 
-    # Bollinger Band squeeze (volatility)
+    # Bollinger Bands
     bb_std = close.rolling(20).std().iloc[-1]
     bb_upper = ma20 + 2 * bb_std
     bb_lower = ma20 - 2 * bb_std
-    near_bb_upper = current > bb_upper * 0.98
 
-    # Signal scoring (hedge fund discipline)
+    # MACD (12/26/9)
+    macd_line, signal_line = compute_macd(close)
+    macd_now = macd_line.iloc[-1]
+    signal_now = signal_line.iloc[-1]
+    macd_above_signal = bool(macd_now > signal_now)
+
+    # Check bullish crossover in last 3 candles
+    crossover_bullish = False
+    if len(macd_line) >= 4:
+        macd_vals = macd_line.iloc[-4:].values
+        sig_vals = signal_line.iloc[-4:].values
+        for i in range(1, len(macd_vals)):
+            if not np.isnan(macd_vals[i]) and not np.isnan(sig_vals[i]):
+                if macd_vals[i] > sig_vals[i] and macd_vals[i-1] <= sig_vals[i-1]:
+                    crossover_bullish = True
+                    break
+
+    macd_bullish = macd_above_signal or crossover_bullish
+
+    # Handle NaN MACD
+    if np.isnan(macd_now) or np.isnan(signal_now):
+        macd_bullish = False
+
+    # TP and SL (hedge fund standard: +8% TP, -4% SL)
+    tp = round(current * 1.08, 0)
+    sl = round(current * 0.96, 0)
+    tp_pct = 8.0
+    sl_pct = -4.0
+
+    # === 6 CONDITIONS ===
     conditions = {
-        "uptrend": bool(ma20 > ma50),
-        "volume_spike": bool(vol_ratio >= 2.0),    # 2x average = whale activity
-        "rsi_ok": bool(30 <= rsi <= 65),           # Not overbought, not oversold
+        "uptrend":          bool(ma20 > ma50),
+        "volume_spike":     bool(vol_ratio >= 2.0),
+        "rsi_ok":           bool(rsi > 25 and rsi < 70),
+        "price_above_ma20": bool(current > ma20),
+        "macd_bullish":     bool(macd_bullish),
         "momentum_positive": bool(daily_change_pct > 0),
-        "not_approaching_limit": bool(not approaching_ara),
     }
 
     score = sum(conditions.values())
 
-    # Determine signal
-    if score >= 4:
-        signal = "BUY"
+    # Signal levels
+    if score >= 5:
+        signal = "STRONG BUY"
     elif score >= 3:
         signal = "WATCH"
     else:
@@ -193,17 +243,23 @@ def compute_signals(ticker: str, df: pd.DataFrame) -> dict:
     if conditions["uptrend"]:
         reasons.append(f"MA20 ({ma20:.0f}) > MA50 ({ma50:.0f}) → uptrend")
     if conditions["volume_spike"]:
-        reasons.append(f"Volume {vol_ratio:.1f}x avg → potensi whale")
+        reasons.append(f"Volume spike {vol_ratio:.1f}x avg → potensi whale")
     if conditions["rsi_ok"]:
         reasons.append(f"RSI {rsi:.1f} — zona aman")
-    elif rsi > 70:
+    elif rsi >= 70:
         reasons.append(f"RSI {rsi:.1f} — overbought, hati-hati")
-    elif rsi < 30:
-        reasons.append(f"RSI {rsi:.1f} — oversold, potensi rebound")
+    elif rsi <= 25:
+        reasons.append(f"RSI {rsi:.1f} — oversold extreme")
+    if crossover_bullish:
+        reasons.append("MACD bullish crossover")
+    elif macd_above_signal:
+        reasons.append("MACD bullish (line > signal)")
     if near_arb:
         reasons.append("⚠️ Mendekati ARB")
     if approaching_ara:
         reasons.append("⚠️ Mendekati ARA — risiko jebakan")
+    if conditions["price_above_ma20"]:
+        reasons.append(f"Harga di atas MA20")
 
     return {
         "ticker": ticker,
@@ -214,6 +270,12 @@ def compute_signals(ticker: str, df: pd.DataFrame) -> dict:
         "ma50": round(float(ma50), 0),
         "rsi": round(float(rsi), 1),
         "vol_ratio": round(float(vol_ratio), 2),
+        "macd_bullish": bool(macd_bullish),
+        "macd_crossover": bool(crossover_bullish),
+        "tp": round(float(tp), 0),
+        "sl": round(float(sl), 0),
+        "tp_pct": tp_pct,
+        "sl_pct": sl_pct,
         "score": int(score),
         "conditions": conditions,
         "approaching_ara": bool(approaching_ara),
@@ -233,7 +295,7 @@ def get_sector_performance(signals: list) -> dict:
         if not sector_signals:
             continue
         avg_change = sum(s["daily_change_pct"] for s in sector_signals) / len(sector_signals)
-        buy_count = sum(1 for s in sector_signals if s["signal"] == "BUY")
+        buy_count = sum(1 for s in sector_signals if s["signal"] == "STRONG BUY")
         sector_data[sector] = {
             "avg_change_pct": round(avg_change, 2),
             "buy_count": buy_count,
@@ -244,12 +306,12 @@ def get_sector_performance(signals: list) -> dict:
 
 
 def get_claude_market_context(signals: list, macro: dict) -> str:
-    """Use Claude Haiku to generate market context/reasoning."""
+    """Use Claude Sonnet for richer sector rotation narrative."""
     if not ANTHROPIC_API_KEY:
         return None
 
     try:
-        buy_signals = [s for s in signals if s["signal"] == "BUY"]
+        buy_signals = [s for s in signals if s["signal"] == "STRONG BUY"]
         watch_signals = [s for s in signals if s["signal"] == "WATCH"]
 
         macro_text = "\n".join([
@@ -258,25 +320,26 @@ def get_claude_market_context(signals: list, macro: dict) -> str:
         ])
 
         buy_text = "\n".join([
-            f"- {s['ticker'].replace('.JK', '')}: RSI {s['rsi']}, Vol {s['vol_ratio']}x, {s['daily_change_pct']:+.2f}%"
+            f"- {s['ticker'].replace('.JK', '')}: RSI {s['rsi']}, Vol {s['vol_ratio']}x, "
+            f"MACD {'✅' if s['macd_bullish'] else '❌'}, {s['daily_change_pct']:+.2f}%"
             for s in buy_signals[:5]
         ]) or "Tidak ada"
 
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         response = client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=300,
+            model="claude-sonnet-4-5",
+            max_tokens=400,
             messages=[{
                 "role": "user",
-                "content": f"""Kamu analis saham Indonesia. Berikan 2-3 kalimat konteks pasar singkat (bahasa Indonesia) berdasarkan:
+                "content": f"""Kamu senior analis saham Indonesia di hedge fund. Berikan 3-4 kalimat konteks pasar yang tajam (bahasa Indonesia) berdasarkan:
 
 Makro hari ini:
 {macro_text}
 
-Sinyal BUY teratas:
+Sinyal STRONG BUY teratas:
 {buy_text}
 
-Fokus: dampak makro ke IHSG & sektor mana yang menarik. Singkat, tajam, actionable."""
+Fokus: rotasi sektor, dampak makro ke IHSG, peluang konkret. Singkat, presisi, actionable."""
             }]
         )
         return response.content[0].text.strip()
@@ -296,24 +359,26 @@ def scan_all() -> list:
             signal = compute_signals(ticker, df)
             if signal:
                 results.append(signal)
-                print(f"  {ticker}: {signal['signal']} (score={signal['score']}, RSI={signal['rsi']}, vol={signal['vol_ratio']}x)")
+                print(f"  {ticker}: {signal['signal']} (score={signal['score']}/6, "
+                      f"RSI={signal['rsi']}, vol={signal['vol_ratio']}x, "
+                      f"MACD={'✅' if signal['macd_bullish'] else '❌'})")
         except Exception as e:
             print(f"[Scanner] Error processing {ticker}: {e}")
 
-    # Sort: BUY first, then WATCH, then by score
+    # Sort: STRONG BUY first, then WATCH, then by score
     results.sort(key=lambda x: (-x["score"], x["signal"]))
     return results
 
 
 def format_morning_alert(signals: list, macro: dict = None, market_context: str = None) -> str:
-    """Format morning briefing Telegram message with macro + sector context"""
-    buy_signals = [s for s in signals if s["signal"] == "BUY"]
+    """Format morning briefing Telegram message with macro + trade setup"""
+    strong_buy_signals = [s for s in signals if s["signal"] == "STRONG BUY"]
     watch_signals = [s for s in signals if s["signal"] == "WATCH"]
 
     now_wib = datetime.utcnow() + timedelta(hours=7)
     lines = [
         f"🏦 <b>MORNING SCAN — {now_wib.strftime('%d %b %Y %H:%M')} WIB</b>",
-        f"<i>Hedge fund mode: hanya sinyal kuat yang lolos</i>",
+        f"<i>Hedge fund mode: STRONG BUY hanya 5-6/6 konfirmasi</i>",
         "",
     ]
 
@@ -331,18 +396,26 @@ def format_morning_alert(signals: list, macro: dict = None, market_context: str 
         lines.append(f"💡 <i>{market_context}</i>")
         lines.append("")
 
-    if buy_signals:
-        lines.append("🟢 <b>STRONG BUY SIGNALS:</b>")
-        for s in buy_signals[:5]:
+    if strong_buy_signals:
+        lines.append(f"🟢 <b>STRONG BUY SIGNALS ({len(strong_buy_signals)} saham):</b>")
+        for s in strong_buy_signals[:5]:
             ticker_clean = s["ticker"].replace(".JK", "")
             whale = "🐋 " if s["vol_ratio"] >= 2.0 else ""
+            macd_tag = "✅" if s.get("macd_bullish") else "❌"
+            ma_tag = "✅" if s["conditions"].get("uptrend") else "❌"
+
+            lines.append(f"")
+            lines.append(f"{whale}<b>{ticker_clean}</b> — STRONG BUY ({s['score']}/6)")
+            lines.append(f"📍 Entry : Rp {s['current']:,.0f}")
+            lines.append(f"🎯 TP    : Rp {s['tp']:,.0f} (+{s.get('tp_pct', 8.0):.0f}%)")
+            lines.append(f"🛡 SL    : Rp {s['sl']:,.0f} ({s.get('sl_pct', -4.0):.0f}%)")
             lines.append(
-                f"{whale}<b>{ticker_clean}</b> Rp{s['current']:,.0f} "
-                f"({s['daily_change_pct']:+.2f}%) "
-                f"| RSI {s['rsi']} | Vol {s['vol_ratio']}x | Score {s['score']}/5"
+                f"📊 RSI {s['rsi']} | Vol {s['vol_ratio']}x | MACD {macd_tag} | MA {ma_tag}"
             )
-            if s.get("reasons"):
-                lines.append(f"   <i>{' · '.join(s['reasons'][:2])}</i>")
+            # Key reason
+            key_reasons = [r for r in s.get("reasons", []) if "warning" not in r.lower() and "⚠️" not in r]
+            if key_reasons:
+                lines.append(f"💡 {' + '.join(key_reasons[:2])}")
         lines.append("")
 
     if watch_signals:
@@ -351,11 +424,11 @@ def format_morning_alert(signals: list, macro: dict = None, market_context: str 
             ticker_clean = s["ticker"].replace(".JK", "")
             lines.append(
                 f"<b>{ticker_clean}</b> Rp{s['current']:,.0f} "
-                f"({s['daily_change_pct']:+.2f}%) | Score {s['score']}/5"
+                f"({s['daily_change_pct']:+.2f}%) | Score {s['score']}/6"
             )
         lines.append("")
 
-    if not buy_signals and not watch_signals:
+    if not strong_buy_signals and not watch_signals:
         lines.append("⚠️ <b>Tidak ada sinyal kuat hari ini.</b>")
         lines.append("Market conditions tidak ideal — hold cash lebih aman.")
         lines.append("")
@@ -366,7 +439,7 @@ def format_morning_alert(signals: list, macro: dict = None, market_context: str 
 
 def format_realtime_alert(signals: list, scan_time: str) -> str:
     """Format real-time monitoring alert (condensed)"""
-    buy_signals = [s for s in signals if s["signal"] == "BUY"]
+    buy_signals = [s for s in signals if s["signal"] == "STRONG BUY"]
     if not buy_signals:
         return None
 
@@ -374,9 +447,10 @@ def format_realtime_alert(signals: list, scan_time: str) -> str:
     for s in buy_signals[:3]:
         ticker_clean = s["ticker"].replace(".JK", "")
         whale = "🐋 " if s["vol_ratio"] >= 2.0 else ""
+        macd_tag = "✅" if s.get("macd_bullish") else "❌"
         lines.append(
             f"{whale}<b>{ticker_clean}</b> {s['daily_change_pct']:+.2f}% "
-            f"| RSI {s['rsi']} | Vol {s['vol_ratio']}x"
+            f"| RSI {s['rsi']} | Vol {s['vol_ratio']}x | MACD {macd_tag} | {s['score']}/6"
         )
         if s.get("reasons"):
             lines.append(f"   <i>{s['reasons'][0]}</i>")
@@ -444,7 +518,7 @@ def run_morning_scan():
 
 
 def run_realtime_scan():
-    """Real-time scan during market hours — alert only on new BUY signals"""
+    """Real-time scan during market hours — alert only on new STRONG BUY signals"""
     try:
         now_wib = datetime.utcnow() + timedelta(hours=7)
         scan_time = now_wib.strftime("%H:%M")
@@ -457,7 +531,7 @@ def run_realtime_scan():
             ok = send_telegram(msg)
             print(f"[Scanner] Real-time alert sent: {ok}")
         else:
-            print(f"[Scanner] No BUY signals at {scan_time}")
+            print(f"[Scanner] No STRONG BUY signals at {scan_time}")
 
         return signals
     except Exception as e:
@@ -475,7 +549,10 @@ def run_closing_report():
     with open(path) as f:
         data = json.load(f)
 
-    morning_signals = {s["ticker"]: s for s in data["signals"] if s["signal"] in ["BUY", "WATCH"]}
+    morning_signals = {
+        s["ticker"]: s for s in data["signals"]
+        if s["signal"] in ["STRONG BUY", "BUY", "WATCH"]
+    }
 
     if not morning_signals:
         return

@@ -19,6 +19,7 @@ from agents.scanner import run_morning_scan, run_closing_report, run_realtime_sc
 from agents.sentinel import run_sentinel
 from agents.radar import run_radar
 from agents.position_tracker import run_position_monitor
+from agents.signal_tracker import log_signals_open, log_signals_close, send_weekly_accuracy_report
 
 
 def now_wib():
@@ -83,8 +84,36 @@ def safe_run_realtime():
 
 # --- Scheduled Jobs ---
 
+def run_morning_scan_with_tracker():
+    """Morning scan + log signals for accuracy tracking."""
+    signals = run_morning_scan()
+    try:
+        log_signals_open(signals)
+    except Exception as e:
+        print(f"[Main] SignalTracker open log error: {e}")
+
+
+def run_closing_report_with_tracker():
+    """Closing delta + evaluate signal accuracy."""
+    run_closing_report()
+    try:
+        log_signals_close()
+    except Exception as e:
+        print(f"[Main] SignalTracker close log error: {e}")
+
+
+def run_weekly_accuracy_report():
+    """Only runs on Fridays."""
+    if now_wib().weekday() != 4:  # 4 = Friday
+        return
+    try:
+        send_weekly_accuracy_report()
+    except Exception as e:
+        print(f"[Main] Weekly accuracy report error: {e}")
+
+
 # Morning scan (UTC 01:45 = WIB 08:45)
-schedule.every().day.at("01:45").do(safe_run, run_morning_scan, "Morning Scan")
+schedule.every().day.at("01:45").do(safe_run, run_morning_scan_with_tracker, "Morning Scan + Tracker")
 
 # Market open commodity check (UTC 02:00 = WIB 09:00)
 schedule.every().day.at("02:00").do(safe_run, run_radar, "Radar (Market Open)")
@@ -111,8 +140,11 @@ schedule.every().day.at("06:00").do(safe_run, run_radar, "Radar")
 schedule.every().day.at("07:00").do(safe_run, run_sentinel, "Sentinel")
 schedule.every().day.at("07:00").do(safe_run, run_radar, "Radar")
 
-# Closing delta report (UTC 08:35 = WIB 15:35)
-schedule.every().day.at("08:35").do(safe_run, run_closing_report, "Closing Delta Report")
+# Closing delta report + signal accuracy (UTC 08:35 = WIB 15:35)
+schedule.every().day.at("08:35").do(safe_run, run_closing_report_with_tracker, "Closing Delta Report + Tracker")
+
+# Friday weekly accuracy report (UTC 08:40 = WIB 15:40)
+schedule.every().day.at("08:40").do(safe_run, run_weekly_accuracy_report, "Weekly Accuracy Report")
 
 
 def run_daemon():
@@ -137,9 +169,9 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         cmd = sys.argv[1]
         if cmd == "scan":
-            run_morning_scan()
+            run_morning_scan_with_tracker()
         elif cmd == "close":
-            run_closing_report()
+            run_closing_report_with_tracker()
         elif cmd == "sentinel":
             run_sentinel()
         elif cmd == "radar":
@@ -148,9 +180,11 @@ if __name__ == "__main__":
             run_realtime_scan()
         elif cmd == "positions":
             run_position_monitor()
+        elif cmd == "weekly":
+            send_weekly_accuracy_report()
         elif cmd == "daemon":
             run_daemon()
         else:
-            print("Usage: python main.py [scan|close|sentinel|radar|realtime|positions|daemon]")
+            print("Usage: python main.py [scan|close|sentinel|radar|realtime|positions|weekly|daemon]")
     else:
         run_daemon()

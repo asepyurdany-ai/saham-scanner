@@ -159,7 +159,11 @@ Analisa berita berikut dan tentukan:
 4. Ringkasan 1 kalimat dalam Bahasa Indonesia
 
 Format JSON array:
-[{{"judul": "...", "sentimen": "...", "dampak": "...", "saham": ["BBCA", "BMRI"], "ringkasan": "..."}}]
+[{{"judul": "...", "sentimen": "POSITIF/NEGATIF/NETRAL", "dampak": "TINGGI/SEDANG/RENDAH", "confidence": "TINGGI/SEDANG", "saham": ["BBCA", "BMRI"], "ringkasan": "..."}}]
+
+Field confidence:
+- TINGGI: berita jelas, dampak terukur, sumber kredibel, korelasi kuat ke saham
+- SEDANG: ada ketidakpastian atau dampak tidak langsung
 
 Berita:
 {news_text}
@@ -168,8 +172,8 @@ Hanya kembalikan JSON, tidak ada teks lain."""
 
     try:
         response = client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=1000,
+            model="claude-sonnet-4-5",
+            max_tokens=1500,
             messages=[{"role": "user", "content": prompt}]
         )
         raw = response.content[0].text.strip()
@@ -194,6 +198,8 @@ def format_news_alert(analyses: list, articles: list) -> str:
     for a in analyses:
         if a.get("dampak") == "RENDAH":
             continue  # Skip low impact
+        if a.get("confidence", "TINGGI") != "TINGGI":
+            continue  # Only alert TINGGI confidence
 
         emoji = "🟢" if a["sentimen"] == "POSITIF" else "🔴" if a["sentimen"] == "NEGATIF" else "⚪"
         impact_emoji = "🔥" if a.get("dampak") == "TINGGI" else "📌"
