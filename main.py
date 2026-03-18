@@ -440,16 +440,10 @@ def run_daemon():
     print("  15:40 WIB (Fri) - Weekly accuracy + improvement report + journal")
     print("[Saham Scanner] Self-healing: agents auto-restart on failure")
     print("[Saham Scanner] Error logging: via SelfImprover.log_error")
-    print("[Saham Scanner] Telegram command handler: starting background thread")
-
-    # Start Telegram command handler in background thread
-    telegram_thread = threading.Thread(
-        target=check_telegram_commands,
-        name="TelegramCommandHandler",
-        daemon=True
-    )
-    telegram_thread.start()
-    print(f"[Saham Scanner] Telegram command handler running (thread: {telegram_thread.name})")
+    # NOTE: Telegram command handler DISABLED in daemon.
+    # Commands (/beli, /jual, /posisi, /journal) are handled by OpenClaw (Dexter).
+    # Polling getUpdates here causes 409 conflict with OpenClaw gateway.
+    print("[Saham Scanner] Telegram commands: handled by OpenClaw (not daemon)")
 
     while True:
         try:
