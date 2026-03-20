@@ -54,7 +54,7 @@ IDX_HOLIDAYS_2026 = {
     "2026-01-27": "Isra Mi'raj Nabi Muhammad SAW",
     "2026-01-29": "Tahun Baru Imlek",
     "2026-03-19": "Hari Raya Nyepi",
-    "2026-03-20": "Wafat Isa Almasih",
+    "2026-04-03": "Wafat Isa Almasih",
     "2026-04-01": "Hari Raya Idul Fitri",
     "2026-04-02": "Hari Raya Idul Fitri",
     "2026-04-03": "Cuti Bersama Idul Fitri",
