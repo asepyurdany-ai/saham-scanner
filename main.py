@@ -594,11 +594,17 @@ def run_daemon():
     # Polling getUpdates here causes 409 conflict with OpenClaw gateway.
     print("[Saham Scanner] Telegram commands: handled by OpenClaw (not daemon)")
 
+    consecutive_errors = 0
     while True:
         try:
             schedule.run_pending()
+            consecutive_errors = 0
         except Exception as e:
-            print(f"[Main] Scheduler error (will continue): {e}")
+            consecutive_errors += 1
+            print(f"[Main] Scheduler error #{consecutive_errors}: {e}")
+            if consecutive_errors >= 10:
+                print("[Main] Too many consecutive errors — restarting scheduler loop")
+                consecutive_errors = 0
         time.sleep(30)
 
 
