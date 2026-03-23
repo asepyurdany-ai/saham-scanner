@@ -23,6 +23,7 @@ from datetime import datetime, timedelta
 from agents.scanner import (
     run_morning_scan, run_closing_report, run_realtime_scan, run_sell_scan
 )
+from agents.intraday_scanner import run_intraday_scan_and_alert
 from agents.sentinel import run_sentinel
 from agents.radar import run_radar, run_macro_shock_check
 from agents.market_breadth import run_breadth_check
@@ -350,6 +351,14 @@ schedule.every().day.at("01:45").do(safe_run, run_morning_sequence, "Morning Seq
 # ─── Market open commodity check (UTC 02:00 = WIB 09:00) ───────────────────
 schedule.every().day.at("02:00").do(safe_run, run_radar, "Radar (Market Open)")
 
+# ─── Intraday scans (UTC 02:05 = WIB 09:05, UTC 02:30 = WIB 09:30) ─────────
+schedule.every().day.at("02:05").do(
+    safe_run, run_intraday_scan_and_alert, "Intraday Scan 09:05 WIB"
+)
+schedule.every().day.at("02:30").do(
+    safe_run, run_intraday_scan_and_alert, "Intraday Scan 09:30 WIB"
+)
+
 # ─── Real-time + Sell scan: every 10 min during market hours ───────────────
 REALTIME_SLOTS = [
     "01:55", "02:05", "02:15", "02:25", "02:35", "02:45", "02:55",
@@ -581,6 +590,8 @@ def run_daemon():
     print("  08:45 WIB - Morning Sequence: Radar → Sentinel → Scanner (full context)")
     print("  08:45 WIB - Shared Intelligence: agents saling connected via market context")
     print("  08:55-15:00 WIB - Macro shock check every 5 min")
+    print("  09:05 WIB - Intraday scan (VWAP/BB/Stoch/OBV/Vol/MACD — 5m data)")
+    print("  09:30 WIB - Intraday scan (second pass)")
     print("  08:55-15:00 WIB - Real-time every 10 min (Scanner + PositionTracker + SellScan)")
     print("  08:55-15:00 WIB - Position P&L update every 30 min")
     print("  08:55-15:00 WIB - Market breadth gate check every 30 min")
@@ -643,7 +654,9 @@ if __name__ == "__main__":
             run_premarket_briefing()
         elif cmd == "breadth":
             run_breadth_check()
+        elif cmd == "intraday":
+            run_intraday_scan_and_alert()
         else:
-            print("Usage: python main.py [scan|close|sentinel|radar|realtime|sell|macro|positions|positions_update|weekly|improve|journal|premarket|breadth|daemon]")
+            print("Usage: python main.py [scan|close|sentinel|radar|realtime|sell|macro|positions|positions_update|weekly|improve|journal|premarket|breadth|intraday|daemon]")
     else:
         run_daemon()
