@@ -218,8 +218,30 @@ def format_news_alert(analyses: list, articles: list) -> str:
     return "\n".join(lines)
 
 
+def is_notifications_paused() -> bool:
+    """Check if notifications are paused for today."""
+    try:
+        import json as _json
+        ctx_path = os.path.join(os.path.dirname(__file__), '..', 'data', 'market_context.json')
+        with open(ctx_path, 'r') as f:
+            ctx = _json.load(f)
+        paused_until = ctx.get('notifications_paused_until')
+        if paused_until:
+            from datetime import timezone
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            until = datetime.fromisoformat(paused_until)
+            if now < until:
+                print(f"[Sentinel] Notifications paused until {paused_until}. Skipping.")
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def run_sentinel():
     """Main sentinel run — call every 30 minutes during market hours"""
+    if is_notifications_paused():
+        return
     print("[Sentinel] Fetching news...")
     seen = load_seen()
 

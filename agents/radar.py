@@ -544,7 +544,28 @@ def run_geo_check():
         print(f"[Radar] MarketContext geo update error: {e}")
 
 
+def is_notifications_paused() -> bool:
+    """Check if notifications are paused for today."""
+    try:
+        ctx_path = os.path.join(os.path.dirname(__file__), '..', 'data', 'market_context.json')
+        with open(ctx_path, 'r') as f:
+            ctx = json.load(f)
+        paused_until = ctx.get('notifications_paused_until')
+        if paused_until:
+            from datetime import timezone
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            until = datetime.fromisoformat(paused_until)
+            if now < until:
+                print(f"[Radar] Notifications paused until {paused_until}. Skipping.")
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def run_radar():
+    if is_notifications_paused():
+        return
     run_commodity_check()
     run_geo_check()
 
