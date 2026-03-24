@@ -451,6 +451,8 @@ def format_macro_shock_alert(shocks: list) -> str:
 
 def run_macro_shock_check() -> list:
     """Check macro shock — called every 5 min during market hours."""
+    if is_notifications_paused():
+        return []
     print("[Radar] Checking macro shock...")
     shocks = check_macro_shock()
     if shocks:
