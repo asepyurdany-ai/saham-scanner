@@ -24,6 +24,7 @@ import requests
 import os
 import time
 from datetime import datetime, timedelta
+from typing import Optional
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -327,6 +328,22 @@ def compute_volume_spike(hist_5m: pd.DataFrame) -> dict:
         return empty
 
 
+def _get_live_price_for_ticker(ticker: str) -> Optional[float]:
+    """
+    Fetch live/current price for a ticker using live_price agent.
+    Falls back to yfinance intraday close if live_price unavailable.
+    Returns None on total failure.
+    """
+    try:
+        from agents.live_price import get_live_price
+        result = get_live_price(ticker)
+        if result and result.get("price") and not result.get("error"):
+            return float(result["price"])
+    except Exception as e:
+        print(f"[Intraday] live_price fetch error for {ticker}: {e}")
+    return None
+
+
 def compute_intraday_score(ticker: str, hist_5m: pd.DataFrame) -> dict:
     """
     Compute all intraday indicators and score for a ticker.
@@ -346,7 +363,9 @@ def compute_intraday_score(ticker: str, hist_5m: pd.DataFrame) -> dict:
         return {"ticker": ticker, "error": "No data", "score": 0, "signal": "AVOID"}
 
     try:
-        current_price = float(hist_5m["Close"].iloc[-1])
+        # Try live price first (multi-source, handles stale Yahoo Finance)
+        live_px = _get_live_price_for_ticker(ticker)
+        current_price = live_px if live_px else float(hist_5m["Close"].iloc[-1])
 
         # Compute all indicators
         vwap = compute_vwap(hist_5m)
