@@ -441,10 +441,28 @@ def format_macro_shock_alert(shocks: list) -> str:
             else:
                 lines.append("Minyak turun tajam → tekanan sektor energi.")
 
-    priority = ", ".join(MACRO_SHOCK_PRIORITY_STOCKS)
+    # Only show stocks currently held in positions
+    try:
+        from agents.position_tracker import load_positions, DEFAULT_POSITIONS_FILE
+        positions = load_positions(DEFAULT_POSITIONS_FILE)
+        held = [t.replace('.JK', '') for t in positions.keys()]
+        priority_held = [s for s in MACRO_SHOCK_PRIORITY_STOCKS if s in held]
+        # Also add any held stocks impacted by current shock commodities
+        for shock in shocks:
+            impacted = COMMODITY_IMPACT.get(shock['name'], [])
+            for s in impacted:
+                ticker = s.replace('.JK', '')
+                if ticker in held and ticker not in priority_held:
+                    priority_held.append(ticker)
+    except Exception:
+        priority_held = []
+
     lines.append("")
     lines.append("⚠️ Pertimbangkan reduce exposure.")
-    lines.append(f"Prioritas exit: {priority}")
+    if priority_held:
+        lines.append(f"Posisi terdampak: {', '.join(priority_held)}")
+    else:
+        lines.append("Tidak ada posisi aktif yang terdampak langsung.")
 
     return "\n".join(lines)
 
