@@ -449,8 +449,12 @@ def format_macro_shock_alert(shocks: list) -> str:
     return "\n".join(lines)
 
 
+_last_macro_alert_hash = None
+_last_macro_alert_time = 0
+
 def run_macro_shock_check() -> list:
     """Check macro shock — called every 5 min during market hours."""
+    global _last_macro_alert_hash, _last_macro_alert_time
     if is_notifications_paused():
         return []
     print("[Radar] Checking macro shock...")
@@ -458,7 +462,17 @@ def run_macro_shock_check() -> list:
     if shocks:
         msg = format_macro_shock_alert(shocks)
         if msg:
+            import hashlib, time as _time
+            msg_hash = hashlib.md5(msg.encode()).hexdigest()
+            now = _time.time()
+            # Dedup: skip if same alert sent within 15 minutes
+            if msg_hash == _last_macro_alert_hash and (now - _last_macro_alert_time) < 900:
+                print("[Radar] Duplicate macro shock suppressed.")
+                return shocks
             ok = send_telegram(msg)
+            if ok:
+                _last_macro_alert_hash = msg_hash
+                _last_macro_alert_time = now
             print(f"[Radar] Macro shock alert sent: {ok}")
     else:
         print("[Radar] No macro shock detected")
