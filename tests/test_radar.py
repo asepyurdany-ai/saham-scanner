@@ -576,11 +576,11 @@ class TestFormatMacroShockAlert:
         assert "USD/IDR" in msg
         assert "2.1" in msg
 
-    def test_contains_priority_stocks(self):
-        """Message should list priority exit stocks."""
+    def test_contains_exposure_warning(self):
+        """Message should contain exposure warning (positions-aware)."""
         from agents.radar import format_macro_shock_alert
         msg = format_macro_shock_alert([self._make_shock()])
-        assert "GOTO" in msg or "BUKA" in msg or "BMRI" in msg
+        assert "reduce exposure" in msg.lower() or "terdampak" in msg.lower()
 
     def test_wib_timestamp_present(self):
         """Message should contain WIB timestamp."""
